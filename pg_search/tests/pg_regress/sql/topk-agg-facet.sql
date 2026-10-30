@@ -1,0 +1,2117 @@
+-- Test Top K + Aggregates + Faceting
+-- Phase 1: Basic Top K tests with window aggregate detection
+
+CREATE EXTENSION IF NOT EXISTS pg_search;
+
+DROP TABLE IF EXISTS products CASCADE;
+
+-- Setup test data
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    description TEXT,
+    category TEXT,
+    brand TEXT,
+    price FLOAT,
+    rating FLOAT,
+    in_stock BOOLEAN,
+    sales INTEGER
+);
+
+-- Insert test data
+INSERT INTO products (name, description, category, brand, price, rating, in_stock, sales) VALUES
+    ('MacBook Pro', 'High-performance laptop for professionals', 'Laptops', 'Apple', 2499, 4.8, true, 150),
+    ('Dell XPS 13', 'Compact and powerful ultrabook', 'Laptops', 'Dell', 1299, 4.6, true, 200),
+    ('ThinkPad X1', 'Business laptop with great keyboard', 'Laptops', 'Lenovo', 1599, 4.5, true, 180),
+    ('HP Spectre', 'Stylish convertible laptop', 'Laptops', 'HP', 1399, 4.4, true, 120),
+    ('ASUS ROG', 'Gaming laptop with RTX graphics', 'Laptops', 'ASUS', 1899, 4.7, true, 90);
+
+-- Create BM25 index
+CREATE INDEX products_idx ON products
+USING paradedb (id, name, description, (category::pdb.unicode_words('columnar=true')), (brand::pdb.unicode_words('columnar=true')), price, rating, in_stock, sales);
+
+-- =============================================================================
+-- OPERATOR SUPPORT TESTS
+-- Testing that window aggregate pushdown works with all search operators
+-- =============================================================================
+
+-- Test 1a: Window aggregate with ||| operator (match disjunction)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 1b: Window aggregate with &&& operator (match conjunction)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description &&& 'laptop powerful'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description &&& 'laptop powerful'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 1c: Window aggregate with === operator (term search)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description === 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description === 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 1d: Window aggregate with ### operator (phrase search)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description ### 'laptop for'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description ### 'laptop for'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 1e: Window aggregate with proximity operator (## - any order)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description @@@ ('laptop' ## 10 ## 'powerful')
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description @@@ ('laptop' ## 10 ## 'powerful')
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 1f: Window aggregate with proximity operator (##> - in order)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description @@@ ('laptop' ##> 10 ##> 'professionals')
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description @@@ ('laptop' ##> 10 ##> 'professionals')
+ORDER BY rating DESC
+LIMIT 3;
+
+-- =============================================================================
+-- BASIC TOP K TESTS
+-- =============================================================================
+
+-- Test 1: Basic Top K without window aggregates
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    category,
+    rating
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    category,
+    rating
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 2: Top K with COUNT(*) OVER () - Basic window aggregate
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 3: Multiple window aggregates (COUNT, SUM, AVG)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    COUNT(*) OVER () as total_count,
+    SUM(price) OVER () as total_price,
+    AVG(rating) OVER () as avg_rating
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    COUNT(*) OVER () as total_count,
+    SUM(price) OVER () as total_price,
+    AVG(rating) OVER () as avg_rating
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 4: Window aggregate with PARTITION BY (not supported yet, but should extract)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    category,
+    rating,
+    COUNT(*) OVER (PARTITION BY category) as category_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    category,
+    rating,
+    COUNT(*) OVER (PARTITION BY category) as category_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 5: Window aggregate with ORDER BY in OVER clause
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    SUM(price) OVER (ORDER BY rating DESC) as running_total
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    SUM(price) OVER (ORDER BY rating DESC) as running_total
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 6: Window aggregate with ROWS frame
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    AVG(rating) OVER (ORDER BY rating DESC ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as moving_avg
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    AVG(rating) OVER (ORDER BY rating DESC ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as moving_avg
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 7: MIN and MAX window aggregates
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    MIN(price) OVER () as min_price,
+    MAX(price) OVER () as max_price
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    MIN(price) OVER () as min_price,
+    MAX(price) OVER () as max_price
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 8: Window aggregate with FILTER clause
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    in_stock,
+    COUNT(*) FILTER (WHERE in_stock = true) OVER () as in_stock_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    in_stock,
+    COUNT(*) FILTER (WHERE in_stock = true) OVER () as in_stock_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 9: COUNT with specific column (not *)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(brand) OVER () as brand_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(brand) OVER () as brand_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 10: Complex PARTITION BY and ORDER BY combination
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    category,
+    brand,
+    rating,
+    COUNT(*) OVER (PARTITION BY category ORDER BY rating DESC) as category_rank_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    category,
+    brand,
+    rating,
+    COUNT(*) OVER (PARTITION BY category ORDER BY rating DESC) as category_rank_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 11: Window aggregate without ORDER BY on base query
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description ||| 'laptop';
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE description ||| 'laptop';
+
+-- Test 12: Window aggregate with RANGE frame
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    SUM(price) OVER (ORDER BY rating RANGE BETWEEN 0.5 PRECEDING AND 0.5 FOLLOWING) as range_sum
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    SUM(price) OVER (ORDER BY rating RANGE BETWEEN 0.5 PRECEDING AND 0.5 FOLLOWING) as range_sum
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 13: Multiple different PARTITION BY clauses
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    category,
+    brand,
+    rating,
+    COUNT(*) OVER (PARTITION BY category) as by_category,
+    COUNT(*) OVER (PARTITION BY brand) as by_brand,
+    COUNT(*) OVER () as total
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    category,
+    brand,
+    rating,
+    COUNT(*) OVER (PARTITION BY category) as by_category,
+    COUNT(*) OVER (PARTITION BY brand) as by_brand,
+    COUNT(*) OVER () as total
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 14: Window aggregate with GROUPS frame (PG17+)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER (ORDER BY rating GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) as group_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER (ORDER BY rating GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) as group_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 15: Top K with no @@@ operator (should not trigger window function handling)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE rating > 4.5
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER () as total_count
+FROM products
+WHERE rating > 4.5
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 16: Window aggregate with multiple base table columns
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    category,
+    brand,
+    price,
+    rating,
+    sales,
+    COUNT(*) OVER () as total_count,
+    SUM(sales) OVER () as total_sales
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 2;
+
+SELECT 
+    id,
+    name,
+    category,
+    brand,
+    price,
+    rating,
+    sales,
+    COUNT(*) OVER () as total_count,
+    SUM(sales) OVER () as total_sales
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 2;
+
+-- Test 17: Window aggregate in a subquery (Top K in outer query)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT * FROM (
+    SELECT 
+        id,
+        name,
+        rating,
+        price,
+        COUNT(*) OVER () as total_count
+    FROM products
+    WHERE description ||| 'laptop'
+    ORDER BY rating DESC
+    LIMIT 5
+) sub
+ORDER BY price DESC
+LIMIT 2;
+
+SELECT * FROM (
+    SELECT 
+        id,
+        name,
+        rating,
+        price,
+        COUNT(*) OVER () as total_count
+    FROM products
+    WHERE description ||| 'laptop'
+    ORDER BY rating DESC
+    LIMIT 5
+) sub
+ORDER BY price DESC
+LIMIT 2;
+
+-- Test 18: Value Facet - Category distribution (like Elasticsearch value facets)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    category,
+    rating,
+    COUNT(*) OVER () as total_results,
+    COUNT(*) OVER (PARTITION BY category) as category_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    category,
+    rating,
+    COUNT(*) OVER () as total_results,
+    COUNT(*) OVER (PARTITION BY category) as category_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 19: Range Facet - Price buckets (like Elasticsearch range facets)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    price,
+    CASE 
+        WHEN price < 1000 THEN 'Budget'
+        WHEN price < 1500 THEN 'Mid-range'
+        ELSE 'Premium'
+    END as price_bucket,
+    COUNT(*) OVER () as total_results,
+    COUNT(*) OVER (PARTITION BY CASE 
+        WHEN price < 1000 THEN 'Budget'
+        WHEN price < 1500 THEN 'Mid-range'
+        ELSE 'Premium'
+    END) as bucket_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 5;
+
+SELECT 
+    id,
+    name,
+    price,
+    CASE 
+        WHEN price < 1000 THEN 'Budget'
+        WHEN price < 1500 THEN 'Mid-range'
+        ELSE 'Premium'
+    END as price_bucket,
+    COUNT(*) OVER () as total_results,
+    COUNT(*) OVER (PARTITION BY CASE 
+        WHEN price < 1000 THEN 'Budget'
+        WHEN price < 1500 THEN 'Mid-range'
+        ELSE 'Premium'
+    END) as bucket_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 5;
+
+-- Test 20: Multi-facet - Brand + Price range (combining multiple facets)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    brand,
+    price,
+    COUNT(*) OVER () as total_results,
+    COUNT(*) OVER (PARTITION BY brand) as brand_count,
+    AVG(price) OVER (PARTITION BY brand) as avg_brand_price
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    brand,
+    price,
+    COUNT(*) OVER () as total_results,
+    COUNT(*) OVER (PARTITION BY brand) as brand_count,
+    AVG(price) OVER (PARTITION BY brand) as avg_brand_price
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 21: Facet with aggregates - MIN/MAX price per category
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    category,
+    price,
+    COUNT(*) OVER () as total_results,
+    MIN(price) OVER (PARTITION BY category) as category_min_price,
+    MAX(price) OVER (PARTITION BY category) as category_max_price
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    category,
+    price,
+    COUNT(*) OVER () as total_results,
+    MIN(price) OVER (PARTITION BY category) as category_min_price,
+    MAX(price) OVER (PARTITION BY category) as category_max_price
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 22: Boolean facet - In-stock availability
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    in_stock,
+    COUNT(*) OVER () as total_results,
+    COUNT(*) OVER (PARTITION BY in_stock) as stock_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    in_stock,
+    COUNT(*) OVER () as total_results,
+    COUNT(*) OVER (PARTITION BY in_stock) as stock_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 23: Popularity facet - Sales volume buckets
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    sales,
+    CASE 
+        WHEN sales < 100 THEN 'Low'
+        WHEN sales < 150 THEN 'Medium'
+        ELSE 'High'
+    END as sales_volume,
+    COUNT(*) OVER () as total_results,
+    SUM(sales) OVER () as total_sales
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    sales,
+    CASE 
+        WHEN sales < 100 THEN 'Low'
+        WHEN sales < 150 THEN 'Medium'
+        ELSE 'High'
+    END as sales_volume,
+    COUNT(*) OVER () as total_results,
+    SUM(sales) OVER () as total_sales
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 24: Rating histogram - Rating distribution
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    CASE 
+        WHEN rating >= 4.7 THEN 'Excellent (4.7+)'
+        WHEN rating >= 4.5 THEN 'Very Good (4.5-4.7)'
+        WHEN rating >= 4.0 THEN 'Good (4.0-4.5)'
+        ELSE 'Fair (<4.0)'
+    END as rating_tier,
+    COUNT(*) OVER () as total_results,
+    COUNT(*) OVER (PARTITION BY CASE 
+        WHEN rating >= 4.7 THEN 'Excellent (4.7+)'
+        WHEN rating >= 4.5 THEN 'Very Good (4.5-4.7)'
+        WHEN rating >= 4.0 THEN 'Good (4.0-4.5)'
+        ELSE 'Fair (<4.0)'
+    END) as tier_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 5;
+
+SELECT 
+    id,
+    name,
+    rating,
+    CASE 
+        WHEN rating >= 4.7 THEN 'Excellent (4.7+)'
+        WHEN rating >= 4.5 THEN 'Very Good (4.5-4.7)'
+        WHEN rating >= 4.0 THEN 'Good (4.0-4.5)'
+        ELSE 'Fair (<4.0)'
+    END as rating_tier,
+    COUNT(*) OVER () as total_results,
+    COUNT(*) OVER (PARTITION BY CASE 
+        WHEN rating >= 4.7 THEN 'Excellent (4.7+)'
+        WHEN rating >= 4.5 THEN 'Very Good (4.5-4.7)'
+        WHEN rating >= 4.0 THEN 'Good (4.0-4.5)'
+        ELSE 'Fair (<4.0)'
+    END) as tier_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 5;
+
+-- Test 25: Complete faceting scenario - Combining all facet types
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    brand,
+    price,
+    rating,
+    in_stock,
+    -- Overall metrics
+    COUNT(*) OVER () as total_results,
+    AVG(price) OVER () as avg_price,
+    AVG(rating) OVER () as avg_rating,
+    -- Brand facets
+    COUNT(*) OVER (PARTITION BY brand) as brand_count,
+    -- Price range facets
+    COUNT(*) OVER (PARTITION BY CASE 
+        WHEN price < 1500 THEN 'Under $1500'
+        ELSE '$1500+'
+    END) as price_range_count,
+    -- Stock facets
+    COUNT(*) OVER (PARTITION BY in_stock) as stock_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    brand,
+    price,
+    rating,
+    in_stock,
+    -- Overall metrics
+    COUNT(*) OVER () as total_results,
+    AVG(price) OVER () as avg_price,
+    AVG(rating) OVER () as avg_rating,
+    -- Brand facets
+    COUNT(*) OVER (PARTITION BY brand) as brand_count,
+    -- Price range facets
+    COUNT(*) OVER (PARTITION BY CASE 
+        WHEN price < 1500 THEN 'Under $1500'
+        ELSE '$1500+'
+    END) as price_range_count,
+    -- Stock facets
+    COUNT(*) OVER (PARTITION BY in_stock) as stock_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- =============================================================================
+-- QUERY CONTEXT FEATURE FLAG TESTS
+-- Testing HAVING_SUPPORT, and SUBQUERY_SUPPORT feature flags
+-- =============================================================================
+
+-- Test 26: Window function with HAVING clause (should NOT use custom scan - HAVING_SUPPORT=false)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    category,
+    AVG(price) as avg_price,
+    COUNT(*) OVER() AS total_count
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY category
+HAVING AVG(price) > 1000
+ORDER BY avg_price DESC
+LIMIT 3;
+
+SELECT 
+    category,
+    AVG(price) as avg_price,
+    COUNT(*) OVER() AS total_count
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY category
+HAVING AVG(price) > 1000
+ORDER BY avg_price DESC
+LIMIT 3;
+
+-- Test 27: Window function with JOIN (This is supported. Joinscan should engage)
+
+-- Create a second table for JOIN testing
+CREATE TABLE product_categories (
+    name TEXT PRIMARY KEY,
+    description TEXT,
+    priority INTEGER
+);
+
+INSERT INTO product_categories VALUES 
+('Laptops', 'Portable computing devices', 1);
+
+CREATE INDEX product_categories_idx ON product_categories
+USING paradedb ((name::pdb.simple('columnar=true')), (description::pdb.simple('columnar=true')), priority);
+
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    p.id,
+    p.name,
+    p.rating,
+    pc.description as category_desc,
+    COUNT(*) OVER() AS total_count
+FROM products p
+JOIN product_categories pc ON p.category = pc.name
+WHERE p.description ||| 'laptop'
+ORDER BY p.rating DESC
+LIMIT 3;
+
+SELECT
+    p.id,
+    p.name,
+    p.rating,
+    pc.description as category_desc,
+    COUNT(*) OVER() AS total_count
+FROM products p
+JOIN product_categories pc ON p.category = pc.name
+WHERE p.description ||| 'laptop'
+ORDER BY p.rating DESC
+LIMIT 3;
+
+-- Test 27b: Global window function over a JOIN with fast-field join keys
+-- JoinScan absorbs the empty OVER () window aggregates and computes them
+-- in its DataFusion plan (issue #5637).
+CREATE TABLE product_reviews (
+    id SERIAL PRIMARY KEY,
+    product_id INTEGER,
+    content TEXT,
+    score INTEGER
+);
+
+INSERT INTO product_reviews (product_id, content, score) VALUES
+(1, 'Excellent build quality', 95),
+(1, 'Battery could be better', 70),
+(2, 'Great value ultrabook', 88),
+(3, 'Keyboard is fantastic', 91),
+(5, 'Runs hot under load', 65);
+
+CREATE INDEX product_reviews_idx ON product_reviews
+USING paradedb (
+    id,
+    product_id,
+    (content::pdb.unicode_words),
+    score
+); 
+
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT
+    p.id,
+    p.name,
+    r.score,
+    COUNT(*) OVER () AS total_count,
+    SUM(r.score) OVER () AS total_score,
+    AVG(r.score) OVER () AS avg_score,
+    MIN(r.score) OVER () AS min_score,
+    MAX(r.score) OVER () AS max_score
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+SELECT
+    p.id,
+    p.name,
+    r.score,
+    COUNT(*) OVER () AS total_count,
+    SUM(r.score) OVER () AS total_score,
+    AVG(r.score) OVER () AS avg_score,
+    MIN(r.score) OVER () AS min_score,
+    MAX(r.score) OVER () AS max_score
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+-- Test 27c: Window aggregates embedded in target list expressions:
+-- constant arithmetic, a cast, a source column mixed with a window value,
+-- and two window functions in one entry.
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) OVER () + 1 AS count_plus_one,
+    AVG(r.score) OVER ()::float8 AS avg_score,
+    r.score + COUNT(*) OVER () AS score_plus_count,
+    COUNT(*) OVER () + SUM(r.score) OVER () AS count_plus_sum
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) OVER () + 1 AS count_plus_one,
+    AVG(r.score) OVER ()::float8 AS avg_score,
+    r.score + COUNT(*) OVER () AS score_plus_count,
+    COUNT(*) OVER () + SUM(r.score) OVER () AS count_plus_sum
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+-- Test 27d: pdb.agg() as a global window function over a JOIN. JoinScan
+-- computes the document as one more aggregate in its Top-K aggregate node,
+-- above the SQL window aggregate. The spec reads fields of both tables.
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT
+    p.id,
+    r.score,
+    pdb.agg('{
+        "terms": {"field": "brand", "order": {"_key": "asc"}},
+        "aggs": {
+            "avg_score": {"avg": {"field": "score"}},
+            "scores": {"terms": {"field": "score", "order": {"_key": "asc"}}}
+        }
+    }'::jsonb) OVER () AS by_brand,
+    COUNT(*) OVER () AS total_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+SELECT
+    p.id,
+    r.score,
+    pdb.agg('{
+        "terms": {"field": "brand", "order": {"_key": "asc"}},
+        "aggs": {
+            "avg_score": {"avg": {"field": "score"}},
+            "scores": {"terms": {"field": "score", "order": {"_key": "asc"}}}
+        }
+    }'::jsonb) OVER () AS by_brand,
+    COUNT(*) OVER () AS total_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+-- Test 27e: The pdb.agg() document as an input of target list expressions:
+-- read as text, and mixed with a source column.
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT
+    p.id,
+    r.score,
+    pdb.agg('{"avg": {"field": "score"}}'::jsonb) OVER () ->> 'value' AS avg_text,
+    (pdb.agg('{"avg": {"field": "score"}}'::jsonb) OVER () -> 'value')::float8 + r.score AS avg_plus_score
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+SELECT
+    p.id,
+    r.score,
+    pdb.agg('{"avg": {"field": "score"}}'::jsonb) OVER () ->> 'value' AS avg_text,
+    (pdb.agg('{"avg": {"field": "score"}}'::jsonb) OVER () -> 'value')::float8 + r.score AS avg_plus_score
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+-- Test 27f: SQL window aggregates over a JOIN with a parameterized LIMIT.
+-- In a generic plan the fetch is not known at planning, so the Top-K
+-- aggregate carries it as unbound text and execution binds it once the
+-- parameter resolves. The window aggregates stay in the Top-K aggregate node.
+SET plan_cache_mode = force_generic_plan;
+
+PREPARE window_join_param_limit(int) AS
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) OVER () AS total_count,
+    SUM(r.score) OVER () AS total_score,
+    r.score + COUNT(*) OVER () AS score_plus_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT $1;
+
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+EXECUTE window_join_param_limit(3);
+
+EXECUTE window_join_param_limit(3);
+
+DEALLOCATE window_join_param_limit;
+
+-- A pdb.agg() window has no Postgres fallback, so a generic plan must stay on
+-- the Top-K aggregate path. Plain EXPLAIN shows k as the unbound
+-- `LIMIT + OFFSET` text; each EXECUTE binds its own values on the one plan.
+PREPARE pdb_agg_join_param_fetch(int, int) AS
+SELECT
+    p.id,
+    r.score,
+    pdb.agg('{"avg": {"field": "score"}}'::jsonb) OVER () AS avg_score
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC, r.id
+LIMIT $1 OFFSET $2;
+
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+EXECUTE pdb_agg_join_param_fetch(2, 1);
+
+EXECUTE pdb_agg_join_param_fetch(2, 1);
+EXECUTE pdb_agg_join_param_fetch(3, 0);
+
+-- The same rows as with the values written in.
+SELECT
+    p.id,
+    r.score,
+    pdb.agg('{"avg": {"field": "score"}}'::jsonb) OVER () AS avg_score
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC, r.id
+LIMIT 2 OFFSET 1;
+
+DEALLOCATE pdb_agg_join_param_fetch;
+
+-- OFFSET alone parameterized: k is the static LIMIT plus the bound OFFSET.
+PREPARE pdb_agg_join_param_offset(int) AS
+SELECT
+    p.id,
+    r.score,
+    pdb.agg('{"avg": {"field": "score"}}'::jsonb) OVER () AS avg_score
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC, r.id
+LIMIT 2 OFFSET $1;
+
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+EXECUTE pdb_agg_join_param_offset(1);
+
+EXECUTE pdb_agg_join_param_offset(1);
+
+DEALLOCATE pdb_agg_join_param_offset;
+
+RESET plan_cache_mode;
+
+-- A pdb.agg() window in a subquery without a LIMIT of its own: JoinScan does
+-- not require a LIMIT in a subquery, but the Top-K aggregate that computes a
+-- pdb.agg() needs one, so JoinScan declines and the query errors.
+EXPLAIN (COSTS OFF)
+SELECT * FROM (
+    SELECT
+        p.id,
+        pdb.agg('{"avg": {"field": "score"}}'::jsonb) OVER () AS avg_score
+    FROM products p
+    JOIN product_reviews r ON p.id = r.product_id
+    WHERE p.description ||| 'laptop'
+) s
+LIMIT 5;
+
+SELECT * FROM (
+    SELECT
+        p.id,
+        pdb.agg('{"avg": {"field": "score"}}'::jsonb) OVER () AS avg_score
+    FROM products p
+    JOIN product_reviews r ON p.id = r.product_id
+    WHERE p.description ||| 'laptop'
+) s
+LIMIT 5;
+
+-- Test 27g: DISTINCT with SQL window aggregates over a JOIN. The DISTINCT
+-- folds into the Top-K aggregate (distinct_topk_as_agg), and the window
+-- aggregates sit beside it in the same node. The window frame is the join
+-- before DISTINCT: product 1 has two reviews, so the count is 4 while DISTINCT
+-- leaves three ids. An entry that is a function of a window aggregate stays
+-- out of the distinct key and is computed after the aggregate.
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT DISTINCT
+    p.id,
+    COUNT(*) OVER () AS total_count,
+    COUNT(*) OVER () + 1 AS total_plus_one
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY p.id DESC
+LIMIT 2;
+
+SELECT DISTINCT
+    p.id,
+    COUNT(*) OVER () AS total_count,
+    COUNT(*) OVER () + 1 AS total_plus_one
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY p.id DESC
+LIMIT 2;
+
+-- A DISTINCT target list of window aggregates alone leaves no key: every row
+-- is one group, so one row comes back.
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT DISTINCT COUNT(*) OVER () AS total_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+LIMIT 3;
+
+SELECT DISTINCT COUNT(*) OVER () AS total_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+LIMIT 3;
+
+-- DISTINCT with window aggregates that read a column (#6501). The DISTINCT
+-- pathkeys include every target entry; a window-only entry is the same on
+-- every row, so it orders nothing and JoinScan still absorbs the query.
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT DISTINCT
+    p.id,
+    SUM(r.score) OVER () AS total_score,
+    MIN(r.score) OVER () AS min_score,
+    MAX(r.score) OVER () AS max_score,
+    COUNT(r.score) OVER () AS score_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY p.id DESC
+LIMIT 2;
+
+SELECT DISTINCT
+    p.id,
+    SUM(r.score) OVER () AS total_score,
+    MIN(r.score) OVER () AS min_score,
+    MAX(r.score) OVER () AS max_score,
+    COUNT(r.score) OVER () AS score_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY p.id DESC
+LIMIT 2;
+
+-- The same without an ORDER BY: the DISTINCT pathkeys alone.
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT DISTINCT SUM(r.score) OVER () AS total_score
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+LIMIT 2;
+
+SELECT DISTINCT SUM(r.score) OVER () AS total_score
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+LIMIT 2;
+
+-- AVG returns an unbounded NUMERIC, which must not stop the DISTINCT column
+-- check for a window-only entry (#6501).
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT DISTINCT p.id, AVG(r.score) OVER () AS avg_score
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY p.id DESC
+LIMIT 2;
+
+SELECT DISTINCT p.id, AVG(r.score) OVER () AS avg_score
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY p.id DESC
+LIMIT 2;
+
+-- An entry mixing a column with a window aggregate varies by row: it is part
+-- of the DISTINCT key, which the scan cannot compute, so JoinScan declines.
+EXPLAIN (COSTS OFF)
+SELECT DISTINCT p.id, r.score + COUNT(*) OVER () AS score_plus_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY p.id DESC, score_plus_count
+LIMIT 3;
+
+SELECT DISTINCT p.id, r.score + COUNT(*) OVER () AS score_plus_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY p.id DESC, score_plus_count
+LIMIT 3;
+
+-- Test 27h: Window aggregates with a FILTER clause over a JOIN. JoinScan
+-- computes `agg FILTER (WHERE ...) OVER ()` in its Top-K aggregate node.
+-- The join has four rows: scores 95 and 70 (product 1), 91 (product 3) and
+-- 65 (product 5). Filters read either side of the join, an unfiltered
+-- COUNT(*) sits beside the filtered one (they must stay separate columns),
+-- and a filter that matches nothing gives 0 for COUNT and NULL otherwise.
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) OVER () AS total_count,
+    COUNT(*) FILTER (WHERE r.score > 80) OVER () AS high_count,
+    SUM(r.score) FILTER (WHERE p.price > 1600) OVER () AS pricey_score,
+    AVG(r.score) FILTER (WHERE r.score > 80) OVER () AS high_avg,
+    MIN(r.score) FILTER (WHERE r.score > 80) OVER () AS high_min,
+    MAX(r.score) FILTER (WHERE r.score < 80 AND p.rating > 4.7) OVER () AS low_max,
+    COUNT(r.score) FILTER (WHERE r.score > 1000) OVER () AS none_count,
+    SUM(r.score) FILTER (WHERE r.score > 1000) OVER () AS none_sum
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) OVER () AS total_count,
+    COUNT(*) FILTER (WHERE r.score > 80) OVER () AS high_count,
+    SUM(r.score) FILTER (WHERE p.price > 1600) OVER () AS pricey_score,
+    AVG(r.score) FILTER (WHERE r.score > 80) OVER () AS high_avg,
+    MIN(r.score) FILTER (WHERE r.score > 80) OVER () AS high_min,
+    MAX(r.score) FILTER (WHERE r.score < 80 AND p.rating > 4.7) OVER () AS low_max,
+    COUNT(r.score) FILTER (WHERE r.score > 1000) OVER () AS none_count,
+    SUM(r.score) FILTER (WHERE r.score > 1000) OVER () AS none_sum
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+-- Filtered window aggregates inside target list expressions.
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) FILTER (WHERE r.score > 80) OVER () + 1 AS high_plus_one,
+    r.score + COUNT(*) FILTER (WHERE r.score > 80) OVER () AS score_plus_high,
+    (COUNT(*) FILTER (WHERE r.score > 80) OVER ())::float8 / COUNT(*) OVER () AS high_ratio
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) FILTER (WHERE r.score > 80) OVER () + 1 AS high_plus_one,
+    r.score + COUNT(*) FILTER (WHERE r.score > 80) OVER () AS score_plus_high,
+    (COUNT(*) FILTER (WHERE r.score > 80) OVER ())::float8 / COUNT(*) OVER () AS high_ratio
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+-- DISTINCT with a filtered window aggregate: the filter applies to the join
+-- rows before DISTINCT, so product 1 contributes both of its reviews.
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT DISTINCT
+    p.id,
+    COUNT(*) FILTER (WHERE r.score > 80) OVER () AS high_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY p.id DESC
+LIMIT 2;
+
+SELECT DISTINCT
+    p.id,
+    COUNT(*) FILTER (WHERE r.score > 80) OVER () AS high_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY p.id DESC
+LIMIT 2;
+
+-- A filtered window aggregate in a subquery without a LIMIT: no Top-K
+-- aggregate, so JoinScan computes it in a DataFusion window node.
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT * FROM (
+    SELECT
+        p.id,
+        r.score,
+        COUNT(*) FILTER (WHERE r.score > 80) OVER () AS high_count
+    FROM products p
+    JOIN product_reviews r ON p.id = r.product_id
+    WHERE p.description ||| 'laptop'
+) s
+ORDER BY score DESC
+LIMIT 5;
+
+SELECT * FROM (
+    SELECT
+        p.id,
+        r.score,
+        COUNT(*) FILTER (WHERE r.score > 80) OVER () AS high_count
+    FROM products p
+    JOIN product_reviews r ON p.id = r.product_id
+    WHERE p.description ||| 'laptop'
+) s
+ORDER BY score DESC
+LIMIT 5;
+
+-- A filter on a columnar text field. The scan compares the stored value, so
+-- 'apple' matches nothing, as in PostgreSQL, and `<>` combines with a
+-- comparison on the other side of the join.
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) FILTER (WHERE p.brand = 'Apple') OVER () AS apple_count,
+    COUNT(*) FILTER (WHERE p.brand = 'apple') OVER () AS lowercase_apple_count,
+    COUNT(*) FILTER (WHERE p.brand <> 'Apple' AND r.score > 60) OVER () AS other_brand_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) FILTER (WHERE p.brand = 'Apple') OVER () AS apple_count,
+    COUNT(*) FILTER (WHERE p.brand = 'apple') OVER () AS lowercase_apple_count,
+    COUNT(*) FILTER (WHERE p.brand <> 'Apple' AND r.score > 60) OVER () AS other_brand_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+-- pdb.agg() with a FILTER. The same spec without and with a filter is two
+-- aggregates, and EXPLAIN shows each pdb_agg(...) call with its FILTER. Plain
+-- EXPLAIN: the VERBOSE output list deparses the search operator with the index
+-- OID, which changes from run to run.
+EXPLAIN (COSTS OFF)
+SELECT
+    p.id,
+    r.score,
+    pdb.agg('{"avg": {"field": "score"}}'::jsonb) OVER () AS avg_score,
+    pdb.agg('{"avg": {"field": "score"}}'::jsonb) FILTER (WHERE r.score > 80) OVER () AS high_avg_score,
+    pdb.agg('{"value_count": {"field": "score"}}'::jsonb) FILTER (WHERE p.description ||| 'gaming') OVER () AS gaming_reviews
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+SELECT
+    p.id,
+    r.score,
+    pdb.agg('{"avg": {"field": "score"}}'::jsonb) OVER () AS avg_score,
+    pdb.agg('{"avg": {"field": "score"}}'::jsonb) FILTER (WHERE r.score > 80) OVER () AS high_avg_score,
+    pdb.agg('{"value_count": {"field": "score"}}'::jsonb) FILTER (WHERE p.description ||| 'gaming') OVER () AS gaming_reviews
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+-- Search operators in a filter, on either side of the join and combined with a
+-- column comparison. Each becomes a tagged query on its source scan, and the
+-- filter reads the tag column. Plain EXPLAIN: the VERBOSE output list
+-- deparses the operator with the index OID, which changes from run to run.
+EXPLAIN (COSTS OFF)
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) FILTER (WHERE r.content ||| 'keyboard') OVER () AS keyboard_count,
+    COUNT(*) FILTER (WHERE p.description ||| 'gaming') OVER () AS gaming_count,
+    COUNT(*) FILTER (WHERE r.content ||| 'battery' OR r.score > 90) OVER () AS battery_or_high
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) FILTER (WHERE r.content ||| 'keyboard') OVER () AS keyboard_count,
+    COUNT(*) FILTER (WHERE p.description ||| 'gaming') OVER () AS gaming_count,
+    COUNT(*) FILTER (WHERE r.content ||| 'battery' OR r.score > 90) OVER () AS battery_or_high
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+-- A comparison the scan could translate, on a column that is not columnar
+-- (content is tokenized): the scan has no values to compare, so JoinScan
+-- declines at planning and PostgreSQL's WindowAgg computes the value.
+EXPLAIN (COSTS OFF)
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) FILTER (WHERE r.content = 'Battery could be better') OVER () AS battery_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) FILTER (WHERE r.content = 'Battery could be better') OVER () AS battery_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+-- An operator the scan cannot translate (LIKE): JoinScan declines, and
+-- PostgreSQL's WindowAgg computes the value.
+EXPLAIN (COSTS OFF)
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) FILTER (WHERE r.content LIKE '%better%') OVER () AS better_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+SELECT
+    p.id,
+    r.score,
+    COUNT(*) FILTER (WHERE r.content LIKE '%better%') OVER () AS better_count
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+ORDER BY r.score DESC
+LIMIT 3;
+
+-- Test 28: Window function in subquery
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT *
+FROM (
+    SELECT 
+        id,
+        name,
+        rating,
+        price,
+        COUNT(*) OVER() AS total_count
+    FROM products
+    WHERE description ||| 'laptop'
+    ORDER BY rating DESC
+    LIMIT 5
+) subq
+WHERE total_count > 0
+ORDER BY price DESC
+LIMIT 3;
+
+SELECT *
+FROM (
+    SELECT 
+        id,
+        name,
+        rating,
+        price,
+        COUNT(*) OVER() AS total_count
+    FROM products
+    WHERE description ||| 'laptop'
+    ORDER BY rating DESC
+    LIMIT 5
+) subq
+WHERE total_count > 0
+ORDER BY price DESC
+LIMIT 3;
+
+-- Test 29: Nested subqueries with window functions
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT outer_query.*
+FROM (
+    SELECT 
+        inner_query.*,
+        ROW_NUMBER() OVER(ORDER BY total_count DESC) as rank
+    FROM (
+        SELECT 
+            id,
+            name,
+            rating,
+            COUNT(*) OVER() AS total_count
+        FROM products
+        WHERE description ||| 'laptop'
+        ORDER BY rating DESC
+        LIMIT 4
+    ) inner_query
+) outer_query
+WHERE rank <= 2;
+
+SELECT outer_query.*
+FROM (
+    SELECT 
+        inner_query.*,
+        ROW_NUMBER() OVER(ORDER BY total_count DESC) as rank
+    FROM (
+        SELECT 
+            id,
+            name,
+            rating,
+            COUNT(*) OVER() AS total_count
+        FROM products
+        WHERE description ||| 'laptop'
+        ORDER BY rating DESC
+        LIMIT 4
+    ) inner_query
+) outer_query
+WHERE rank <= 2;
+
+-- Test 30: Window function with HAVING + JOIN
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    p.category,
+    pc.description,
+    AVG(p.price) as avg_price,
+    COUNT(*) OVER() AS total_count
+FROM products p
+JOIN product_categories pc ON p.category = pc.name
+WHERE p.description ||| 'laptop'
+GROUP BY p.category, pc.description
+HAVING AVG(p.price) > 1000
+ORDER BY avg_price DESC
+LIMIT 2;
+
+SELECT 
+    p.category,
+    pc.description,
+    AVG(p.price) as avg_price,
+    COUNT(*) OVER() AS total_count
+FROM products p
+JOIN product_categories pc ON p.category = pc.name
+WHERE p.description ||| 'laptop'
+GROUP BY p.category, pc.description
+HAVING AVG(p.price) > 1000
+ORDER BY avg_price DESC
+LIMIT 2;
+
+-- Test 31: Window function with FILTER clause in different contexts
+
+-- Simple case
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    in_stock,
+    COUNT(*) FILTER (WHERE rating > 4.5) OVER() AS high_rating_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    in_stock,
+    COUNT(*) FILTER (WHERE rating > 4.5) OVER() AS high_rating_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- With HAVING
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    category,
+    AVG(rating) as avg_rating,
+    COUNT(*) FILTER (WHERE price > 1500) OVER() AS expensive_count
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY category
+HAVING AVG(rating) > 4.0
+ORDER BY avg_rating DESC
+LIMIT 2;
+
+SELECT 
+    category,
+    AVG(rating) as avg_rating,
+    COUNT(*) FILTER (WHERE price > 1500) OVER() AS expensive_count
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY category
+HAVING AVG(rating) > 4.0
+ORDER BY avg_rating DESC
+LIMIT 2;
+
+-- Test 32: Mixed supported and unsupported window functions (all-or-nothing test)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    COUNT(*) OVER() AS total_count,                    -- Supported (COUNT_ANY=true)
+    SUM(price) OVER() AS total_price,                  -- Not supported (SUM=false)
+    COUNT(brand) OVER() AS brand_count                 -- Not supported (COUNT=false)
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    COUNT(*) OVER() AS total_count,                    -- Supported (COUNT_ANY=true)
+    SUM(price) OVER() AS total_price,                  -- Not supported (SUM=false)
+    COUNT(brand) OVER() AS brand_count                 -- Not supported (COUNT=false)
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 33: Only supported window functions (should use custom scan)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    COUNT(*) OVER() AS total_count1,                   -- Supported (COUNT_ANY=true)
+    COUNT(*) OVER() AS total_count2                    -- Supported (COUNT_ANY=true)
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    COUNT(*) OVER() AS total_count1,
+    COUNT(*) OVER() AS total_count2
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 34: Query without ORDER BY and LIMIT (should NOT use custom scan - ONLY_ALLOW_TOP_K=true)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER() AS total_count
+FROM products
+WHERE description ||| 'laptop';
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER() AS total_count
+FROM products
+WHERE description ||| 'laptop';
+
+-- Test 35: Query with ORDER BY but no LIMIT (should NOT use custom scan - ONLY_ALLOW_TOP_K=true)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER() AS total_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC;
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER() AS total_count
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC;
+
+-- Test 36: Query with LIMIT but no ORDER BY (should NOT use custom scan - ONLY_ALLOW_TOP_K=true)
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER() AS total_count
+FROM products
+WHERE description ||| 'laptop'
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    COUNT(*) OVER() AS total_count
+FROM products
+WHERE description ||| 'laptop'
+LIMIT 3;
+
+-- Test 37: Window function with COALESCE
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    COUNT(*) OVER() AS total_count,
+    SUM(COALESCE(price, 0.0)) OVER() AS total_price_with_default,
+    AVG(COALESCE(rating, 4.0)) OVER() AS avg_rating_with_default
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+SELECT 
+    id,
+    name,
+    rating,
+    price,
+    COUNT(*) OVER() AS total_count,
+    SUM(COALESCE(price, 0.0)) OVER() AS total_price_with_default,
+    AVG(COALESCE(rating, 4.0)) OVER() AS avg_rating_with_default
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 3;
+
+-- Test 38: Benchmark query - Top K + COUNT(*) OVER ()
+-- Verify this produces Top K execution plan
+EXPLAIN (FORMAT TEXT, COSTS OFF, TIMING OFF, VERBOSE)
+SELECT id, name, description, category, brand, COUNT(*) OVER ()
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 10;
+
+SELECT id, name, description, category, brand, COUNT(*) OVER ()
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 10;
+
+-- Test 39: Benchmark query - Top K + pdb.agg terms (faceting)
+-- Verify this produces Top K execution plan with custom aggregate
+EXPLAIN (FORMAT TEXT, COSTS OFF, TIMING OFF, VERBOSE)
+SELECT id, name, description, category, brand, pdb.agg('{"terms": {"field": "brand"}}'::jsonb) OVER ()
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 10;
+
+SELECT id, name, description, category, brand, pdb.agg('{"terms": {"field": "brand"}}'::jsonb) OVER ()
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 10;
+
+-- Test 40: Benchmark query - Top K + pdb.agg avg
+-- Verify this produces Top K execution plan with custom aggregate
+EXPLAIN (FORMAT TEXT, COSTS OFF, TIMING OFF, VERBOSE)
+SELECT id, name, description, category, brand, pdb.agg('{"avg": {"field": "rating"}}'::jsonb) OVER ()
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 10;
+
+SELECT id, name, description, category, brand, pdb.agg('{"avg": {"field": "rating"}}'::jsonb) OVER ()
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 10;
+
+-- Test 36: Top K with nested aggregations (window function)
+-- Verify that nested "aggs" work correctly in Top K/window context
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT id, name, brand,
+       pdb.agg('{"terms": {"field": "brand"}, "aggs": {"avg_rating": {"avg": {"field": "rating"}}}}'::jsonb) OVER () AS brand_with_avg_rating
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 5;
+
+SELECT id, name, brand,
+       pdb.agg('{"terms": {"field": "brand"}, "aggs": {"avg_rating": {"avg": {"field": "rating"}}}}'::jsonb) OVER () AS brand_with_avg_rating
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY rating DESC
+LIMIT 5;
+
+-- Test 41a: Single-table GROUP BY with pdb.combine_agg(pdb.agg(...)) OVER ()
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT
+    in_stock,
+    COUNT(*) AS group_rows,
+    COUNT(*) OVER () AS total_groups,
+    pdb.combine_agg(pdb.agg('{"terms": {"field": "brand", "order": {"_key": "asc"}}}'::jsonb)) OVER () AS brands
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY in_stock
+ORDER BY in_stock;
+
+SELECT
+    in_stock,
+    COUNT(*) AS group_rows,
+    COUNT(*) OVER () AS total_groups,
+    pdb.combine_agg(pdb.agg('{"terms": {"field": "brand", "order": {"_key": "asc"}}}'::jsonb)) OVER () AS brands
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY in_stock
+ORDER BY in_stock;
+
+-- Test 41b: JOIN + GROUP BY + ORDER BY + LIMIT with pdb.combine_agg(pdb.agg(...)) OVER ()
+-- and SQL window aggregates over groups
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT
+    p.id,
+    COUNT(*) AS review_count,
+    COUNT(*) OVER () AS total_product_groups,
+    SUM(COUNT(*)) OVER () AS total_reviews,
+    pdb.combine_agg(pdb.agg('{
+        "terms": {"field": "brand", "order": {"_key": "asc"}},
+        "aggs": {
+            "avg_score": {"avg": {"field": "score"}}
+        }
+    }'::jsonb)) OVER () AS by_brand
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+GROUP BY p.id
+ORDER BY review_count DESC, p.id ASC
+LIMIT 2;
+
+SELECT
+    p.id,
+    COUNT(*) AS review_count,
+    COUNT(*) OVER () AS total_product_groups,
+    SUM(COUNT(*)) OVER () AS total_reviews,
+    pdb.combine_agg(pdb.agg('{
+        "terms": {"field": "brand", "order": {"_key": "asc"}},
+        "aggs": {
+            "avg_score": {"avg": {"field": "score"}}
+        }
+    }'::jsonb)) OVER () AS by_brand
+FROM products p
+JOIN product_reviews r ON p.id = r.product_id
+WHERE p.description ||| 'laptop'
+GROUP BY p.id
+ORDER BY review_count DESC, p.id ASC
+LIMIT 2;
+
+-- Prepared statement with parameterized LIMIT $1 OFFSET $2 under generic plan
+BEGIN;
+SET LOCAL plan_cache_mode = 'force_generic_plan';
+
+PREPARE combine_agg_limit(int, int) AS
+SELECT
+    brand,
+    COUNT(*) AS group_rows,
+    COUNT(*) OVER () AS total_groups,
+    pdb.combine_agg(pdb.agg('{"terms": {"field": "brand", "order": {"_key": "asc"}}}'::jsonb)) OVER () AS brands
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY brand
+ORDER BY brand
+LIMIT $1 OFFSET $2;
+
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+EXECUTE combine_agg_limit(2, 0);
+
+EXECUTE combine_agg_limit(2, 0);
+EXECUTE combine_agg_limit(2, 1);
+EXECUTE combine_agg_limit(NULL, 0);
+
+DEALLOCATE combine_agg_limit;
+COMMIT;
+
+-- LIMIT ALL and LIMIT NULL with pdb.combine_agg
+SELECT
+    in_stock,
+    COUNT(*) AS group_rows,
+    pdb.combine_agg(pdb.agg('{"value_count": {"field": "id"}}'::jsonb)) OVER () AS total
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY in_stock
+ORDER BY in_stock
+LIMIT ALL;
+
+SELECT
+    in_stock,
+    COUNT(*) AS group_rows,
+    pdb.combine_agg(pdb.agg('{"value_count": {"field": "id"}}'::jsonb)) OVER () AS total
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY in_stock
+ORDER BY in_stock
+LIMIT NULL;
+
+-- WITH TIES fallback to PostgreSQL for GROUP BY Top-K and BaseScan Top-K
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT brand, COUNT(*) AS cnt
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY brand
+ORDER BY COUNT(*) ASC
+FETCH FIRST 1 ROWS WITH TIES;
+
+SELECT brand, COUNT(*) AS cnt
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY brand
+ORDER BY COUNT(*) ASC
+FETCH FIRST 1 ROWS WITH TIES;
+
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT in_stock
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY in_stock DESC
+FETCH FIRST 1 ROWS WITH TIES;
+
+SELECT in_stock
+FROM products
+WHERE description ||| 'laptop'
+ORDER BY in_stock DESC
+FETCH FIRST 1 ROWS WITH TIES;
+
+-- Test 41c: Validation errors for invalid pdb.combine_agg / pdb.agg OVER () usage
+-- Bare pdb.agg() OVER () in a GROUP BY query must suggest pdb.combine_agg
+SELECT in_stock, pdb.agg('{"avg": {"field": "rating"}}'::jsonb) OVER ()
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY in_stock;
+
+-- Bare pdb.agg() OVER () combined with an aggregate function without GROUP BY
+SELECT COUNT(*), pdb.agg('{"avg": {"field": "rating"}}'::jsonb) OVER ()
+FROM products
+WHERE description ||| 'laptop';
+
+-- pdb.combine_agg without OVER ()
+SELECT in_stock, pdb.combine_agg('{"avg": {"field": "rating"}}'::jsonb)
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY in_stock;
+
+-- pdb.combine_agg OVER () without GROUP BY
+SELECT pdb.combine_agg(pdb.agg('{"avg": {"field": "rating"}}'::jsonb)) OVER ()
+FROM products
+WHERE description ||| 'laptop';
+
+-- pdb.combine_agg OVER () with HAVING
+SELECT in_stock, COUNT(*), pdb.combine_agg(pdb.agg('{"avg": {"field": "rating"}}'::jsonb)) OVER ()
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY in_stock
+HAVING COUNT(*) > 1;
+
+-- Negative LIMIT / OFFSET with pdb.combine_agg must error
+SELECT
+    in_stock,
+    pdb.combine_agg(pdb.agg('{"value_count": {"field": "id"}}'::jsonb)) OVER ()
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY in_stock
+ORDER BY in_stock
+LIMIT -1;
+
+SELECT
+    in_stock,
+    pdb.combine_agg(pdb.agg('{"value_count": {"field": "id"}}'::jsonb)) OVER ()
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY in_stock
+ORDER BY in_stock
+OFFSET -1;
+
+-- FETCH FIRST ... WITH TIES with pdb.combine_agg must error
+SELECT
+    in_stock,
+    pdb.combine_agg(pdb.agg('{"value_count": {"field": "id"}}'::jsonb)) OVER ()
+FROM products
+WHERE description ||| 'laptop'
+GROUP BY in_stock
+ORDER BY in_stock
+FETCH FIRST 1 ROWS WITH TIES;
+
+-- Cleanup
+DROP TABLE product_reviews CASCADE;
+DROP TABLE product_categories CASCADE;
+DROP TABLE products CASCADE;

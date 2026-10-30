@@ -1,0 +1,553 @@
+-- Tests for JoinScan planning on joins with ORDER BY and Top K dynamic filters.
+-- Joins run as hash joins with an explicit sort / Top K; the columnar-sort
+-- SortMergeJoin path has been removed.
+
+-- Disable parallel workers to avoid differences in plans
+SET max_parallel_workers_per_gather = 0;
+SET enable_indexscan to OFF;
+
+-- Load the pg_search extension
+CREATE EXTENSION IF NOT EXISTS pg_search;
+
+-- Make sure the GUC is enabled
+SET paradedb.enable_join_custom_scan = on;
+
+-- =============================================================================
+-- TEST 1: Join on sorted keys (Both sides sorted on join key)
+-- =============================================================================
+
+DROP TABLE IF EXISTS sorted_t1 CASCADE;
+DROP TABLE IF EXISTS sorted_t2 CASCADE;
+
+CREATE TABLE sorted_t1 (id INTEGER PRIMARY KEY, val TEXT) WITH (autovacuum_enabled = false);
+CREATE TABLE sorted_t2 (id INTEGER PRIMARY KEY, t1_id INTEGER, val TEXT) WITH (autovacuum_enabled = false);
+
+INSERT INTO sorted_t1 SELECT i, 'val ' || i FROM generate_series(1, 1000) i;
+INSERT INTO sorted_t2 SELECT i, (i % 1000) + 1, 'val ' || i FROM generate_series(1, 1000) i;
+
+-- Indexes sorted by join key
+-- t1 sorted by id
+CREATE INDEX sorted_t1_idx ON sorted_t1 USING paradedb (id, (val::pdb.unicode_words('columnar=true'))) WITH (sort_by = 'id ASC NULLS FIRST');
+
+-- t2 sorted by t1_id (the foreign key)
+CREATE INDEX sorted_t2_idx ON sorted_t2 USING paradedb (id, t1_id, val) WITH (sort_by = 't1_id ASC NULLS FIRST');
+
+ANALYZE sorted_t1;
+ANALYZE sorted_t2;
+
+-- Join on t1.id = t2.t1_id
+-- Both are sorted on the join key (ASC NULLS FIRST)
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.val, t2.val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 10;
+
+SELECT t1.val, t2.val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 10;
+
+-- =============================================================================
+-- TEST 2: OFFSET + LIMIT on sorted join keys
+-- PostgreSQL's limit_tuples includes the offset (5+10=15), so JoinScan passes
+-- fetch=15 to DataFusion. The EXPLAIN should show SortExec: TopK(fetch=15)
+-- wrapping StripOrderingExec. PostgreSQL's outer Limit applies the offset.
+-- =============================================================================
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.val, t2.val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+OFFSET 5 LIMIT 10;
+
+SELECT t1.val, t2.val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+OFFSET 5 LIMIT 10;
+
+-- =============================================================================
+-- TEST 2.1: Parameterized OFFSET with static LIMIT in prepared statements
+-- Verify generic prepared plan does not double-limit when OFFSET is parameterized.
+-- =============================================================================
+
+SET plan_cache_mode = force_generic_plan;
+
+PREPARE prep_join_offset(int) AS
+SELECT t1.val, t2.val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 5 OFFSET $1;
+
+-- Offset 0: should return 5 rows
+EXECUTE prep_join_offset(0);
+
+-- Offset 10: should return 5 rows, NOT 0 rows
+EXECUTE prep_join_offset(10);
+
+DEALLOCATE prep_join_offset;
+RESET plan_cache_mode;
+
+-- =============================================================================
+-- TEST 2.2: Static LIMIT with static OFFSET
+-- =============================================================================
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.val, t2.val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 5 OFFSET 10;
+
+SELECT t1.val, t2.val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 5 OFFSET 10;
+
+-- =============================================================================
+-- TEST 2.2b: Distributed plan with LIMIT and OFFSET
+-- Verify that GlobalLimitExec skip stays on the leader above the final SortExec,
+-- rather than each worker offsetting its own slice.
+-- =============================================================================
+
+SET max_parallel_workers_per_gather = 2;
+SET paradedb.mpp_min_rows = 0;
+SET paradedb.enable_range_partitioned_join = on;
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.val, t2.val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 5 OFFSET 10;
+
+SELECT t1.val, t2.val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 5 OFFSET 10;
+
+RESET paradedb.enable_range_partitioned_join;
+RESET paradedb.mpp_min_rows;
+SET max_parallel_workers_per_gather = 0;
+
+-- =============================================================================
+-- TEST 2.3: SELECT ... FOR UPDATE preserves row locking (LockRows)
+-- =============================================================================
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.id, t2.id
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 5
+FOR UPDATE OF t1;
+
+-- =============================================================================
+-- TEST 2.4: Volatile expression in target list is projected by Postgres
+-- =============================================================================
+-- JoinScan should be used, with random() evaluated once per output row in the
+-- Postgres projection above the scan, matching where a native plan evaluates it.
+
+SELECT setseed(0.5);
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.id, round((random() * 100)::numeric, 2) AS rand_val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 5;
+
+SELECT setseed(0.5);
+
+SELECT t1.id, round((random() * 100)::numeric, 2) AS rand_val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 5;
+
+-- Same, with the volatile expression reading a column of the other side, so the Postgres
+-- projection takes its input from a Var appended to the scan's output.
+
+SELECT setseed(0.5);
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.id, round((random() * t2.id)::numeric, 2) AS rand_val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 5;
+
+SELECT setseed(0.5);
+
+SELECT t1.id, round((random() * t2.id)::numeric, 2) AS rand_val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 5;
+
+-- =============================================================================
+-- TEST 2.5: Volatile ORDER BY key in the target list declines JoinScan
+-- =============================================================================
+-- A sort key with no column references must not be treated as belonging to an
+-- outer relation and dropped from the scan's sort.
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.id, round((random() * 100)::numeric, 2) AS rand_val
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY rand_val, t1.id
+LIMIT 5;
+
+-- =============================================================================
+-- TEST 2.6: Volatile ORDER BY key only in a hidden sort entry declines JoinScan
+-- =============================================================================
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.id
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY random(), t1.id
+LIMIT 5;
+
+-- =============================================================================
+-- TEST 2.7: Volatile expression Postgres can't project declines JoinScan
+-- =============================================================================
+-- pdb.score() exists only inside the scan, so the fallback can't take the expression.
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.id, random() * pdb.score(t1.id) AS rand_score
+FROM sorted_t1 t1
+JOIN sorted_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 5;
+
+-- =============================================================================
+-- TEST 3: Multi-segment sorted join
+-- =============================================================================
+
+DROP TABLE IF EXISTS multi_seg_1 CASCADE;
+DROP TABLE IF EXISTS multi_seg_2 CASCADE;
+
+CREATE TABLE multi_seg_1 (id INTEGER PRIMARY KEY, val TEXT) WITH (autovacuum_enabled = false);
+CREATE TABLE multi_seg_2 (id INTEGER PRIMARY KEY, t1_id INTEGER, val TEXT) WITH (autovacuum_enabled = false);
+
+-- Force multiple segments using small mutable_segment_rows
+CREATE INDEX multi_seg_1_idx ON multi_seg_1 USING paradedb (id, (val::pdb.unicode_words('columnar=true'))) WITH (sort_by = 'id ASC NULLS FIRST', mutable_segment_rows = 10);
+
+CREATE INDEX multi_seg_2_idx ON multi_seg_2 USING paradedb (id, t1_id, val) WITH (sort_by = 't1_id ASC NULLS FIRST', mutable_segment_rows = 10);
+
+-- Insert 100 rows, should create ~10 segments each
+INSERT INTO multi_seg_1 SELECT i, 'val ' || i FROM generate_series(1, 100) i;
+INSERT INTO multi_seg_2 SELECT i, (i % 100) + 1, 'val ' || i FROM generate_series(1, 100) i;
+
+ANALYZE multi_seg_1;
+ANALYZE multi_seg_2;
+
+-- Verify SortMergeJoin is used with multi-segment indexes
+-- MultiSegmentPlan exposes N partitions. SortMergeJoin should work.
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.val, t2.val
+FROM multi_seg_1 t1
+JOIN multi_seg_2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 10;
+
+SELECT t1.val, t2.val
+FROM multi_seg_1 t1
+JOIN multi_seg_2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 10;
+
+-- =============================================================================
+-- TEST 4: Recursive SortMergeJoin (3 tables sorted by t1.id)
+-- =============================================================================
+
+DROP TABLE IF EXISTS recursive_smj_1 CASCADE;
+DROP TABLE IF EXISTS recursive_smj_2 CASCADE;
+DROP TABLE IF EXISTS recursive_smj_3 CASCADE;
+
+CREATE TABLE recursive_smj_1 (id INTEGER PRIMARY KEY, val TEXT) WITH (autovacuum_enabled = false);
+CREATE TABLE recursive_smj_2 (id INTEGER PRIMARY KEY, t1_id INTEGER, val TEXT) WITH (autovacuum_enabled = false);
+CREATE TABLE recursive_smj_3 (id INTEGER PRIMARY KEY, t1_id INTEGER, val TEXT) WITH (autovacuum_enabled = false);
+
+INSERT INTO recursive_smj_1 SELECT i, 'val ' || i FROM generate_series(1, 100) i;
+INSERT INTO recursive_smj_2 SELECT i, i, 'val ' || i FROM generate_series(1, 100) i;
+INSERT INTO recursive_smj_3 SELECT i, i, 'val ' || i FROM generate_series(1, 100) i;
+
+-- Index for t1 sorted by id
+CREATE INDEX recursive_smj_1_idx ON recursive_smj_1 USING paradedb (id, (val::pdb.unicode_words('columnar=true'))) WITH (sort_by = 'id ASC NULLS FIRST');
+
+-- Index for t2 sorted by t1_id
+CREATE INDEX recursive_smj_2_idx ON recursive_smj_2 USING paradedb (id, t1_id, val) WITH (sort_by = 't1_id ASC NULLS FIRST');
+
+-- Index for t3 sorted by t1_id
+CREATE INDEX recursive_smj_3_idx ON recursive_smj_3 USING paradedb (id, t1_id, val) WITH (sort_by = 't1_id ASC NULLS FIRST');
+
+ANALYZE recursive_smj_1;
+ANALYZE recursive_smj_2;
+ANALYZE recursive_smj_3;
+
+-- Join 3 tables on t1.id
+-- t1.id = t2.t1_id AND t1.id = t3.t1_id
+-- All indexes are sorted by the respective join keys.
+-- Should result in recursive SortMergeJoins without any SortExecs.
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.val, t2.val, t3.val
+FROM recursive_smj_1 t1
+JOIN recursive_smj_2 t2 ON t1.id = t2.t1_id
+JOIN recursive_smj_3 t3 ON t1.id = t3.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 10;
+
+SELECT t1.val, t2.val, t3.val
+FROM recursive_smj_1 t1
+JOIN recursive_smj_2 t2 ON t1.id = t2.t1_id
+JOIN recursive_smj_3 t3 ON t1.id = t3.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.id ASC NULLS FIRST
+LIMIT 10;
+
+-- =============================================================================
+-- TEST 5: Top K dynamic filter pushdown through SortMergeJoin
+-- ORDER BY differs from join key => SortExec(TopK) stays in the plan.
+-- Multiple segments ensure the scan produces multiple batches so Top K can
+-- tighten its threshold between batches and the pre-filter actually prunes.
+-- =============================================================================
+
+DROP TABLE IF EXISTS dyn_filter_t1 CASCADE;
+DROP TABLE IF EXISTS dyn_filter_t2 CASCADE;
+
+CREATE TABLE dyn_filter_t1 (id INTEGER PRIMARY KEY, val TEXT) WITH (autovacuum_enabled = false);
+CREATE TABLE dyn_filter_t2 (id INTEGER PRIMARY KEY, t1_id INTEGER, val TEXT) WITH (autovacuum_enabled = false);
+
+-- Create indexes BEFORE inserting data so inserts go through the mutable
+-- segment pathway, producing multiple segments (index-build on existing data
+-- merges everything into one segment).
+CREATE INDEX dyn_filter_t1_idx ON dyn_filter_t1 USING paradedb (id, (val::pdb.unicode_words('columnar=true'))) WITH (sort_by = 'id ASC NULLS FIRST', mutable_segment_rows = 10000);
+
+CREATE INDEX dyn_filter_t2_idx ON dyn_filter_t2 USING paradedb (id, t1_id, val) WITH (sort_by = 't1_id ASC NULLS FIRST', mutable_segment_rows = 10000);
+
+INSERT INTO dyn_filter_t1 SELECT i, 'val ' || i FROM generate_series(1, 20000) i;
+INSERT INTO dyn_filter_t2 SELECT i, (i % 20000) + 1, 'val ' || i FROM generate_series(1, 20000) i;
+
+ANALYZE dyn_filter_t1;
+ANALYZE dyn_filter_t2;
+
+-- EXPLAIN: check that dynamic_filters appear on the scan
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.val, t2.val
+FROM dyn_filter_t1 t1
+JOIN dyn_filter_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.val ASC
+LIMIT 10;
+
+-- Cap the scanner batch size so Top K can tighten its threshold between batches.
+SET paradedb.dynamic_filter_batch_size = 8192;
+
+-- EXPLAIN ANALYZE: rows_pruned should be > 0 with multiple segments
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF)
+SELECT t1.val, t2.val
+FROM dyn_filter_t1 t1
+JOIN dyn_filter_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.val ASC
+LIMIT 10;
+
+-- Verify results
+SELECT t1.val, t2.val
+FROM dyn_filter_t1 t1
+JOIN dyn_filter_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+ORDER BY t1.val ASC
+LIMIT 10;
+
+-- =============================================================================
+-- TEST 5b: Top K dynamic score filter pushdown
+-- ORDER BY score DESC on the probe side allows Top K to tighten its score
+-- threshold after the first batch and push it into the scanner (dynamic_filter_pushdown_score=1).
+-- =============================================================================
+
+SET paradedb.enable_rank_join = off;
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF)
+SELECT t1.id, t2.id, paradedb.score(t2.id)
+FROM dyn_filter_t1 t1
+JOIN dyn_filter_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val'
+  AND t2.val ||| 'val'
+ORDER BY paradedb.score(t2.id) DESC, t2.id
+LIMIT 10;
+
+RESET paradedb.enable_rank_join;
+
+-- =============================================================================
+-- TEST 6: Top K dynamic filter does not prune NULLs
+-- Top K emits "col IS NULL OR col < threshold". Rows with NULL in the ORDER BY
+-- column must survive the pre-filter (nulls_pass=true) and be returned when
+-- they belong in the Top K. Without nulls_pass, the pre-filter would
+-- incorrectly discard NULLs.
+--
+-- Uses DESC NULLS FIRST so NULLs sort first and belong in the Top K result.
+-- NULLs are placed at high IDs so they land in a later scan batch (after Top K
+-- has already tightened its threshold from earlier batches). This ensures the
+-- pre-filter is active when it encounters NULL values.
+-- =============================================================================
+
+DROP TABLE IF EXISTS null_val_t1 CASCADE;
+DROP TABLE IF EXISTS null_val_t2 CASCADE;
+
+CREATE TABLE null_val_t1 (id INTEGER PRIMARY KEY, val TEXT) WITH (autovacuum_enabled = false);
+CREATE TABLE null_val_t2 (id INTEGER PRIMARY KEY, t1_id INTEGER, val TEXT) WITH (autovacuum_enabled = false);
+
+CREATE INDEX null_val_t1_idx ON null_val_t1 USING paradedb (id, (val::pdb.unicode_words('columnar=true'))) WITH (sort_by = 'id ASC NULLS FIRST', mutable_segment_rows = 10000);
+
+CREATE INDEX null_val_t2_idx ON null_val_t2 USING paradedb (id, t1_id, val) WITH (sort_by = 't1_id ASC NULLS FIRST', mutable_segment_rows = 10000);
+
+-- 20K rows. Most have non-NULL val, but the last 10 (ids 19991-20000) are NULL.
+-- With mutable_segment_rows=10000 the NULLs land in segment 2's later batch,
+-- which is processed after Top K has updated its threshold.
+INSERT INTO null_val_t1
+  SELECT i,
+         CASE WHEN i > 19990 THEN NULL ELSE 'val ' || i END
+  FROM generate_series(1, 20000) i;
+INSERT INTO null_val_t2
+  SELECT i, (i % 20000) + 1, 'val ' || i
+  FROM generate_series(1, 20000) i;
+
+ANALYZE null_val_t1;
+ANALYZE null_val_t2;
+
+-- DESC NULLS FIRST: NULLs belong in the top 25.
+-- The IS NULL OR pattern is decomposed into a PreFilter with nulls_pass=true.
+-- EXPLAIN ANALYZE shows rows_pruned > 0 proving the pre-filter is active
+-- (without the IS NULL OR decomposition, rows_pruned would be 0).
+-- The NULLs in the result prove they survived the pre-filter correctly.
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.id, t1.val
+FROM null_val_t1 t1
+JOIN null_val_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val' OR t1.val IS NULL
+ORDER BY t1.val DESC NULLS FIRST, t1.id
+LIMIT 25;
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF)
+SELECT t1.id, t1.val
+FROM null_val_t1 t1
+JOIN null_val_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val' OR t1.val IS NULL
+ORDER BY t1.val DESC NULLS FIRST, t1.id
+LIMIT 25;
+
+SELECT t1.id, t1.val
+FROM null_val_t1 t1
+JOIN null_val_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val' OR t1.val IS NULL
+ORDER BY t1.val DESC NULLS FIRST, t1.id
+LIMIT 25;
+
+-- =============================================================================
+-- TEST 7: Explicit NULL handling with deferred columns
+-- =============================================================================
+
+-- TEST 8: ORDER BY val ASC NULLS LAST
+-- NULLs should appear last, so the top 10 should be strictly non-NULL values.
+-- This verifies the dictionary decoder correctly sorts NULL_TERM_ORDINAL to the end.
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.id, t1.val
+FROM null_val_t1 t1
+JOIN null_val_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val' OR t1.val IS NULL
+ORDER BY t1.val ASC NULLS LAST
+LIMIT 10;
+
+SELECT t1.id, t1.val
+FROM null_val_t1 t1
+JOIN null_val_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val' OR t1.val IS NULL
+ORDER BY t1.val ASC NULLS LAST
+LIMIT 10;
+
+-- TEST 9: WHERE val IS NULL alone (no BM25 predicate)
+-- Should fetch exactly the 10 NULL rows. 
+-- Verifies the scanner can yield rows when the only filter is a NULL check.
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.id, t1.val
+FROM null_val_t1 t1
+JOIN null_val_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val IS NULL
+ORDER BY t1.id
+LIMIT 25;
+
+SELECT t1.id, t1.val
+FROM null_val_t1 t1
+JOIN null_val_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val IS NULL
+ORDER BY t1.id
+LIMIT 25;
+
+-- TEST 10: Mixed NULL and non-NULL rows in LIMIT results
+-- ORDER BY id DESC limits to the boundary where NULLs and non-NULLs meet.
+-- IDs 19991-20000 are NULL, IDs <= 19990 are non-NULL.
+-- A LIMIT 15 should return exactly 10 NULLs and 5 non-NULLs mixed in the same output batch.
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t1.id, t1.val
+FROM null_val_t1 t1
+JOIN null_val_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val' OR t1.val IS NULL
+ORDER BY t1.id DESC
+LIMIT 15;
+
+SELECT t1.id, t1.val
+FROM null_val_t1 t1
+JOIN null_val_t2 t2 ON t1.id = t2.t1_id
+WHERE t1.val ||| 'val' OR t1.val IS NULL
+ORDER BY t1.id DESC
+LIMIT 15;
+-- =============================================================================
+-- CLEANUP
+-- =============================================================================
+
+RESET paradedb.dynamic_filter_batch_size;
+DROP TABLE IF EXISTS sorted_t1 CASCADE;
+DROP TABLE IF EXISTS sorted_t2 CASCADE;
+DROP TABLE IF EXISTS multi_seg_1 CASCADE;
+DROP TABLE IF EXISTS multi_seg_2 CASCADE;
+DROP TABLE IF EXISTS recursive_smj_1 CASCADE;
+DROP TABLE IF EXISTS recursive_smj_2 CASCADE;
+DROP TABLE IF EXISTS recursive_smj_3 CASCADE;
+DROP TABLE IF EXISTS dyn_filter_t1 CASCADE;
+DROP TABLE IF EXISTS dyn_filter_t2 CASCADE;
+DROP TABLE IF EXISTS null_val_t1 CASCADE;
+DROP TABLE IF EXISTS null_val_t2 CASCADE;
+
+RESET max_parallel_workers_per_gather;
+RESET enable_indexscan;
+RESET paradedb.enable_join_custom_scan;

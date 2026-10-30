@@ -1,0 +1,1766 @@
+// Copyright (c) 2023-2026 ParadeDB, Inc.
+//
+// This file is part of ParadeDB - Postgres for Search and Analytics
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+use tests::fixtures::querygen::distinctgen::arb_distinct_mode;
+use tests::fixtures::querygen::groupbygen::arb_group_by;
+use tests::fixtures::querygen::joingen::{JoinType, arb_joins, arb_semi_joins};
+use tests::fixtures::querygen::mutationgen::churn_setup;
+use tests::fixtures::querygen::numericgen::arb_numeric_expr;
+use tests::fixtures::querygen::orderbygen::arb_joinscan_order_parts;
+use tests::fixtures::querygen::pagegen::arb_paging_exprs;
+use tests::fixtures::querygen::pdbagggen::{
+    arb_pdb_agg_join, arb_pdb_agg_single_table, arb_pdb_agg_window,
+};
+use tests::fixtures::querygen::wheregen::Expr as WhereExpr;
+use tests::fixtures::querygen::wheregen::arb_wheres;
+use tests::fixtures::querygen::windowgen::arb_window_targets;
+use tests::fixtures::querygen::{
+    Column, IndexExpression, PgGucs, QuerySide, Sides, arb_joins_and_wheres,
+    compare_outcome_retrying, compare_outcome_retrying_on, compare_plan_retrying,
+    compare_plan_retrying_on, generated_queries_setup,
+};
+
+use tests::fixtures::*;
+
+use futures::executor::block_on;
+use lockfree_object_pool::MutexObjectPool;
+use proptest::prelude::*;
+use rstest::*;
+use sqlx::{PgConnection, Row};
+
+#[cfg(feature = "dst")]
+#[test]
+fn antithesis_sdk_initializes() {
+    ensure_dst_init();
+}
+
+/// Proptest configuration shared by every generator test in this file. Under `dst`, proptest
+/// draws its randomness from the Antithesis SDK, so the platform controls and branches the
+/// entropy stream; otherwise this is just `Config::default()`.
+fn qgen_proptest_config() -> proptest::test_runner::Config {
+    #[allow(unused_mut)]
+    let mut config = proptest::test_runner::Config::default();
+    #[cfg(feature = "dst")]
+    {
+        config.rng_algorithm = proptest::test_runner::RngAlgorithm::Antithesis;
+        // No shrinking: Antithesis controls the entropy stream and fault schedule, so a replay
+        // sees a different history and the minimized input is meaningless.
+        config.max_shrink_iters = 0;
+        config.source_file = Some("tests/tests/qgen.rs");
+    }
+    config
+}
+
+/// Report one case outcome as a per-test Antithesis property, then collapse it to a proptest
+/// result. The single `Always` assertion doubles as a reachability check: cataloged, it fails as
+/// unreached if the generator never produces a case. No-op under a plain `cargo test`.
+macro_rules! qgen_oracle {
+    ($prop:literal, $outcome:expr) => {{
+        let outcome = $outcome;
+        ensure_dst_init();
+        match &outcome {
+            tests::fixtures::querygen::CaseOutcome::Match => {
+                dst::assert_always!(true, $prop, &serde_json::json!({}));
+            }
+            tests::fixtures::querygen::CaseOutcome::Failure(e) => {
+                dst::assert_always!(
+                    false,
+                    $prop,
+                    &serde_json::json!({ "detail": e.to_string() })
+                );
+            }
+            // compare_outcome_retrying resolves every Transient by retrying, so this arm is
+            // defensive.
+            tests::fixtures::querygen::CaseOutcome::Transient(_, e) => {
+                dst::assert_always!(
+                    false,
+                    $prop,
+                    &serde_json::json!({ "detail": e.to_string() })
+                );
+            }
+        }
+        outcome.into_test_result()
+    }};
+}
+
+const COLUMNS: &[Column] = &[
+    Column::new("id", "SERIAL8", "'4'")
+        .primary_key()
+        .groupable({
+            true
+        }),
+    Column::new("uuid", "UUID", "'550e8400-e29b-41d4-a716-446655440000'")
+        .groupable({
+            true
+        })
+        .random_generator_sql("rpad(lpad((random() * 2147483647)::integer::text, 10, '0'), 32, '0')::uuid"),
+    Column::new("name", "TEXT", "'bob'")
+        .index_expression(IndexExpression::Literal)
+        .random_generator_sql(
+            "(ARRAY ['alice', 'bob', 'cloe', 'sally', 'brandy', 'brisket', 'anchovy']::text[])[(floor(random() * 7) + 1)::int]"
+        ),
+    Column::new("color", "VARCHAR", "'blue'")
+        .whereable(true)
+        .index_expression(IndexExpression::Literal)
+        .random_generator_sql(
+            "(ARRAY ['red', 'green', 'blue', 'orange', 'purple', 'pink', 'yellow', NULL]::text[])[(floor(random() * 8) + 1)::int]"
+        ),
+    Column::new("age", "INTEGER", "'20'")
+        .random_generator_sql("(floor(random() * 100) + 1)"),
+    Column::new("quantity", "INTEGER", "'7'")
+        .whereable(true)
+        .random_generator_sql("CASE WHEN random() < 0.1 THEN NULL ELSE (floor(random() * 100) + 1)::int END"),
+    Column::new("price", "NUMERIC(10,2)", "'99.99'")
+        .groupable({
+            // TODO: Grouping on a float fails to ORDER BY (even in cases without an ORDER BY):
+            // ```
+            // Cannot ORDER BY OrderByInfo
+            // ```
+            false
+        })
+        .random_generator_sql("(random() * 1000 + 10)::numeric(10,2)"),
+    // Additional NUMERIC columns for testing Numeric64 vs NumericBytes storage
+    Column::new("small_numeric", "NUMERIC(5,2)", "'12.34'")
+        .groupable(false)
+        .random_generator_sql("(random() * 100)::numeric(5,2)"),
+    Column::new("int_numeric", "NUMERIC(10,0)", "'12345'")
+        .groupable(false)
+        .random_generator_sql("(floor(random() * 1000000))::numeric(10,0)"),
+    Column::new("high_scale", "NUMERIC(18,6)", "'123.456789'")
+        .groupable(false)
+        .random_generator_sql("(random() * 10000)::numeric(18,6)"),
+    Column::new("big_numeric", "NUMERIC", "'12345.67890'")
+        .groupable(false)  // Cannot aggregate NumericBytes
+        .random_generator_sql("(random() * 100000)::numeric"),
+    Column::new("rating", "INTEGER", "'4'")
+        .indexed({
+            // Marked un-indexed in order to test heap-filter pushdown.
+            false
+        })
+        .random_generator_sql("(floor(random() * 5) + 1)::int"),
+    Column::new("category", "TEXT", "'electronics'")
+        .whereable(false)
+        .index_expression(IndexExpression::Upper)
+        .random_generator_sql(
+            "(ARRAY ['electronics', 'clothing', 'food', 'books', 'toys', 'sports', 'home']::text[])[(floor(random() * 7) + 1)::int]"
+        ),
+    Column::new("literal_normalized", "TEXT", "'Hello World'")
+        .whereable({
+            // literal_normalized lowercases text, so BM25 @@@ would match case-insensitively
+            // while PostgreSQL = does exact matching. This causes test failures when comparing
+            // results, so we exclude it from WHERE clause testing.
+            false
+        })
+        .groupable(false)
+        .index_expression(IndexExpression::LiteralNormalized)
+        .random_generator_sql(
+            "(ARRAY ['Hello World', 'HELLO WORLD', 'hello world', 'HeLLo WoRLD', 'GOODBYE WORLD', 'goodbye world']::text[])[(floor(random() * 6) + 1)::int]"
+        ),
+    Column::new("metadata", "JSONB", "'{\"brand\": \"apple\", \"rating\": 4}'")
+        .whereable(false)
+        .groupable(false)
+        .index_expression(IndexExpression::UnicodeWordsColumnar)
+        .random_generator_sql(
+            "CASE (floor(random() * 5))::int
+                WHEN 0 THEN NULL
+                WHEN 1 THEN '{}'::jsonb
+                ELSE jsonb_build_object(
+                'brand', (ARRAY ['apple', 'samsung', 'sony', 'lg']::text[])[(floor(random() * 4) + 1)::int],
+                'rating', CASE WHEN random() < 0.2 THEN NULL ELSE (floor(random() * 5) + 1)::int END,
+                'details', jsonb_build_object(
+                    'score', CASE WHEN random() < 0.2 THEN NULL ELSE (floor(random() * 200) - 100) / 4.0 END
+                )
+            ) END"
+        ),
+    Column::new("tags", "TEXT[]", "ARRAY['alpha', 'beta']::text[]")
+        .whereable(false)
+        .groupable(false)
+        .index_expression(IndexExpression::Literal)
+        .random_generator_sql(
+            "(CASE (floor(random() * 5) + 1)::int \
+                WHEN 1 THEN ARRAY['alpha', 'beta']::text[] \
+                WHEN 2 THEN ARRAY['gamma']::text[] \
+                WHEN 3 THEN ARRAY['delta', 'epsilon', 'zeta']::text[] \
+                WHEN 4 THEN NULL \
+                ELSE ARRAY[]::text[] \
+            END)",
+        ),
+];
+
+fn columns_named(names: Vec<&'static str>) -> Vec<Column> {
+    COLUMNS
+        .iter()
+        .filter(|c| names.contains(&c.name))
+        .cloned()
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SubqueryKind {
+    Exists,
+    In,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SubqueryPolarity {
+    Positive,
+    Negated,
+}
+
+/// How an `EXISTS` subquery reads the outer row's column.
+#[derive(Clone, Copy, Debug)]
+enum SubqueryCorrelation {
+    /// `inner.col = outer.col`
+    Var,
+    /// `inner.col = (SELECT outer.col)`: the value arrives through an InitPlan, which a
+    /// parallel plan has to hand its workers on every rescan.
+    InitPlan,
+}
+
+#[derive(Clone, Debug)]
+struct GeneratedSubquery {
+    kind: SubqueryKind,
+    polarity: SubqueryPolarity,
+    correlation: SubqueryCorrelation,
+    column: &'static str,
+    inner_where_expr: WhereExpr,
+    paging_exprs: String,
+}
+
+impl GeneratedSubquery {
+    fn to_sql(&self, op: &str, outer_table_name: &str, inner_table_name: &str) -> String {
+        let base = match self.kind {
+            SubqueryKind::Exists => format!(
+                "EXISTS (\
+                    SELECT 1 FROM {inner_table_name} \
+                    WHERE {inner_table_name}.{column} = {outer_value} \
+                    AND {} {}\
+                )",
+                self.inner_where_expr.to_sql(op),
+                self.paging_exprs,
+                column = self.column,
+                outer_value = match self.correlation {
+                    SubqueryCorrelation::Var => format!("{outer_table_name}.{}", self.column),
+                    SubqueryCorrelation::InitPlan => {
+                        format!("(SELECT {outer_table_name}.{})", self.column)
+                    }
+                },
+            ),
+            SubqueryKind::In => format!(
+                "{outer_table_name}.{column} IN (\
+                    SELECT {column} FROM {inner_table_name} WHERE {} {}\
+                )",
+                self.inner_where_expr.to_sql(op),
+                self.paging_exprs,
+                column = self.column,
+            ),
+        };
+
+        match (self.kind, self.polarity) {
+            (_, SubqueryPolarity::Positive) => base,
+            (SubqueryKind::Exists, SubqueryPolarity::Negated) => format!("NOT {base}"),
+            (SubqueryKind::In, SubqueryPolarity::Negated) => format!("NOT ({base})"),
+        }
+    }
+}
+
+///
+/// Tests all join configurations against small tables (important for joins that produce
+/// cartesian products or expansive results).
+///
+/// When the generated query is within the subset guaranteed to be plannable by ParadeDB's
+/// custom scan (INNER/OUTER joins without Cartesian products, LIMIT present, and GUC enabled),
+/// this test explicitly verifies via EXPLAIN that PostgreSQL selected ParadeDB Join Scan
+/// (or Aggregate Scan). For all queries, it verifies exact result correctness and parity
+/// against PostgreSQL.
+///
+#[rstest]
+#[case::clean(false)]
+#[case::churn(true)]
+#[tokio::test]
+async fn generated_joins_small(database: Db, #[case] churn_on: bool) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let tables_and_sizes = [("users", 10), ("products", 10), ("orders", 10)];
+    let tables = tables_and_sizes
+        .iter()
+        .map(|(table, _)| table)
+        .collect::<Vec<_>>();
+    let setup_sql = generated_queries_setup(&pool, &tables_and_sizes, COLUMNS);
+    let setup_sql = churn_setup(&pool, setup_sql, &tables_and_sizes, COLUMNS, churn_on);
+
+    let where_and_join_columns = columns_named(vec!["id", "name", "color", "age", "uuid", "tags"]);
+
+    proptest!(qgen_proptest_config(), |(
+        ((join, where_expr, cross_rel), distinct_mode, mut order_parts, window_targets, pdb_agg) in arb_joins_and_wheres(
+            any::<JoinType>(),
+            tables,
+            &where_and_join_columns,
+        ).prop_flat_map(|(join, where_expr, cross_rel)| {
+            let used_tables = join
+                .used_tables()
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let pdb_agg = proptest::option::of(arb_pdb_agg_window(
+                used_tables.clone(),
+                join.has_keyless_step(),
+                join.unnested_fields(),
+            ));
+            (
+                Just((join, where_expr, cross_rel)),
+                arb_distinct_mode(used_tables.clone(), COLUMNS),
+                arb_joinscan_order_parts(used_tables.clone(), false),
+                arb_window_targets(used_tables),
+                pdb_agg,
+            )
+        }),
+        limit in proptest::option::of(1..=50usize),
+        offset in proptest::option::of(0..=10usize),
+        gucs in any::<PgGucs>(),
+    )| {
+        let join_clause = join.to_sql();
+        let used_tables = join.used_tables();
+
+        // Assert that JoinScan or AggregateScan was actually used.
+        // With JoinScan running at UPPERREL_FINAL, all generated join shapes (inner, outer,
+        // cross, multi-table, DISTINCT, lateral unnest, and expression ordering)
+        // are plannable by ParadeDB's custom scan whenever LIMIT is present, except when
+        // outer joins combine with null-testing predicates (`IS NULL`, `IS NOT NULL`, or
+        // negated equivalents). PostgreSQL's optimizer (`reduce_outer_joins`) converts such
+        // outer joins into anti-joins (`JOIN_ANTI`) and prunes the inner relation. When join keys
+        // or projections reference columns from the pruned relation with no output-visible
+        // equivalent, JoinScan intentionally declines to plan (see `rewrite_pruned_join_keys`).
+        let expect_custom_scan = gucs.join_custom_scan
+            && limit.is_some()
+            && window_targets.iter().all(|t| t.is_absorbable())
+            // DISTINCT + window declines: the window expression is itself a
+            // DISTINCT column, so the query's distinct pathkeys always
+            // contain it and JoinScan's ORDER BY resolution refuses the path
+            // ("unsupported ORDER BY expression shape").
+            && !(distinct_mode.is_distinct() && !window_targets.is_empty())
+            && !(!join.has_only_inner() && where_expr.has_null_predicate());
+
+        // `pdb.agg()` has no PostgreSQL fallback, so a JoinScan that declines is an
+        // error, not a second path to compare. Its window form joins the target
+        // list only where the scan has to engage, and not under DISTINCT, where
+        // a jsonb target entry declines. The planner hook also raises an error
+        // for a `pdb.agg()` window whose WHERE clause needs a heap filter while
+        // filter pushdown is off. PostgreSQL never runs it: the spec's
+        // `GROUP BY` over the same join is the oracle for the document.
+        let pdb_agg = pdb_agg.filter(|_| {
+            expect_custom_scan && gucs.filter_pushdown && !distinct_mode.is_distinct()
+        });
+
+        let mut target_cols = vec![
+            format!("{}.id", used_tables[0]),
+            format!("{}.name", used_tables[0]),
+        ];
+
+        if distinct_mode.is_distinct() {
+            for table in &used_tables[1..] {
+                let col = format!("{}.id", table);
+                if !target_cols.contains(&col) {
+                    target_cols.push(col);
+                }
+            }
+
+            if let Some(expr) = distinct_mode.expression() {
+                let expr_sql = expr.to_sql();
+                if !target_cols.contains(&expr_sql) {
+                    target_cols.push(expr_sql);
+                }
+            }
+
+            // Ensure every expression in order_parts appears in SELECT DISTINCT
+            // to satisfy PostgreSQL's requirement that ORDER BY expressions must appear in the SELECT list.
+            for part in &order_parts {
+                if !target_cols.contains(part) {
+                    target_cols.push(part.clone());
+                }
+            }
+        }
+        for target in &window_targets {
+            target_cols.push(target.to_sql());
+        }
+        for alias in join.unnest_aliases() {
+            target_cols.push(alias.to_string());
+        }
+
+        let target_cols_str = target_cols.join(", ");
+        let distinct_kw = if distinct_mode.is_distinct() { "DISTINCT " } else { "" };
+        let from = format!("SELECT {distinct_kw}{target_cols_str} {join_clause}");
+        // The document goes last, where `window_rows` reads it.
+        let bm25_from = match &pdb_agg {
+            Some(agg) => format!(
+                "SELECT {distinct_kw}{target_cols_str}, {} OVER () {join_clause}",
+                agg.call()
+            ),
+            None => from.clone(),
+        };
+
+        let (where_pg, where_bm25) = match &cross_rel {
+            Some(cr) => (
+                format!("({}) AND ({})", where_expr.to_sql(" = "), cr.to_sql()),
+                format!("({}) AND ({})", where_expr.to_sql("@@@"), cr.to_sql()),
+            ),
+            None => (where_expr.to_sql(" = "), where_expr.to_sql("@@@")),
+        };
+
+        for alias in join.unnest_aliases() {
+            order_parts.push(alias.to_string());
+        }
+        let order_by = order_parts.join(", ");
+
+        let offset_clause = match offset {
+            Some(o) if o > 0 => format!(" OFFSET {o}"),
+            _ => "".to_string(),
+        };
+
+        let limit_clause = match limit {
+            Some(l) => format!("LIMIT {l}{offset_clause}"),
+            None => "".to_string(),
+        };
+
+        let pg_query = format!("{from} WHERE {where_pg} ORDER BY {order_by} {limit_clause}");
+        let bm25_query = format!("{bm25_from} WHERE {where_bm25} ORDER BY {order_by} {limit_clause}");
+        let pdb_window = pdb_agg
+            .as_ref()
+            .map(|agg| (agg, agg.pg_query(&join_clause, &where_pg)));
+
+        if expect_custom_scan {
+            // A leftover PostgreSQL WindowAgg node would mean the scan
+            // engaged without absorbing the window aggregates (#5637).
+            let forbidden: &[&str] = if window_targets.is_empty() && pdb_agg.is_none() {
+                &[]
+            } else {
+                &["WindowAgg"]
+            };
+            qgen_oracle!(
+                "qgen: generated_joins_small - ParadeDB custom scan planned",
+                compare_plan_retrying(
+                    &pg_query,
+                    &bm25_query,
+                    &gucs,
+                    &pool,
+                    &setup_sql,
+                    &["ParadeDB Join Scan", "ParadeDB Aggregate Scan"],
+                    forbidden,
+                )
+            )?;
+        }
+
+        // A `pdb.agg()` document takes the typed path too: only the candidate's
+        // rows carry it, so the rows are compared without it and the document
+        // on its own.
+        let typed_rows = !window_targets.is_empty() || pdb_agg.is_some();
+        qgen_oracle!("qgen: generated_joins_small - ParadeDB result matches PostgreSQL", compare_outcome_retrying(
+            &pg_query,
+            &bm25_query,
+            &gucs,
+            &pool,
+            &setup_sql,
+            |query, side, conn| {
+                "SET work_mem TO '16MB';".execute_result(conn)?;
+                let rows = query.fetch_dynamic_result(conn)?;
+                // The document on the candidate's rows against the buckets of the
+                // PostgreSQL `GROUP BY`. With no row there is no document to compare.
+                let mut buckets = match &pdb_window {
+                    Some((agg, pg_buckets_query)) if !rows.is_empty() => {
+                        if side.is_candidate() {
+                            agg.window_rows(&rows)?
+                        } else {
+                            agg.rows(pg_buckets_query.as_str().fetch_dynamic_result(conn)?)?
+                        }
+                    }
+                    _ => Vec::new(),
+                };
+                buckets.sort();
+                let document_cols = usize::from(side.is_candidate() && pdb_window.is_some());
+                let mut row_strings: Vec<String> = rows
+                    .into_iter()
+                    .map(|row| {
+                        use sqlx::Row;
+                        let id: i64 = row.try_get(0).unwrap_or(0);
+                        if !typed_rows {
+                            return format!("{:020}|{:?}", id, row);
+                        }
+                        // Typed, fixed-precision formatting when window
+                        // aggregates are projected: AVG decodes through
+                        // Float64/decimal encodings on the scan side while
+                        // PostgreSQL computes exact NUMERIC averages, so the
+                        // raw row Debug representation would differ in
+                        // insignificant digits.
+                        let mut parts = Vec::new();
+                        for i in 0..row.len() - document_cols {
+                            let part = if let Ok(v) = row.try_get::<i64, _>(i) {
+                                v.to_string()
+                            } else if let Ok(v) = row.try_get::<i32, _>(i) {
+                                v.to_string()
+                            } else if let Ok(v) = row.try_get::<bool, _>(i) {
+                                v.to_string()
+                            } else if let Ok(v) = row.try_get::<sqlx::types::BigDecimal, _>(i) {
+                                format!("{v:.6}")
+                            } else if let Ok(v) = row.try_get::<f64, _>(i) {
+                                format!("{v:.6}")
+                            } else if let Ok(v) = row.try_get::<String, _>(i) {
+                                v
+                            } else {
+                                // NULLs (and any unhandled type) format
+                                // identically on both sides.
+                                "NULL".to_string()
+                            };
+                            parts.push(part);
+                        }
+                        format!("{:020}|{}", id, parts.join("|"))
+                    })
+                    .collect();
+                row_strings.sort();
+                Ok((row_strings, buckets))
+            }
+        ))?;
+    });
+}
+
+#[rstest]
+#[case::clean(false)]
+#[case::churn(true)]
+#[tokio::test]
+async fn generated_single_relation(database: Db, #[case] churn_on: bool) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let table_name = "users";
+    let tables_and_sizes = [(table_name, 10)];
+    let setup_sql = generated_queries_setup(&pool, &tables_and_sizes, COLUMNS);
+    let setup_sql = churn_setup(&pool, setup_sql, &tables_and_sizes, COLUMNS, churn_on);
+
+    proptest!(qgen_proptest_config(), |(
+        where_expr in arb_wheres(
+            vec![table_name],
+            COLUMNS,
+        ),
+        gucs in any::<PgGucs>(),
+        target in prop_oneof![Just("COUNT(*)"), Just("id")],
+    )| {
+        qgen_oracle!("qgen: generated_single_relation - ParadeDB result matches PostgreSQL", compare_outcome_retrying(
+            &format!("SELECT {target} FROM {table_name} WHERE {}", where_expr.to_sql(" = ")),
+            &format!("SELECT {target} FROM {table_name} WHERE {}", where_expr.to_sql("@@@")),
+            &gucs,
+            &pool,
+            &setup_sql,
+            |query, _, conn| {
+                let mut rows = query.fetch_result::<(i64,)>(conn)?;
+                rows.sort();
+                Ok(rows)
+            }
+        ))?;
+    });
+}
+
+///
+/// Property test for GROUP BY aggregates with ORDER BY and LIMIT/OFFSET
+/// - ensures equivalence between PostgreSQL and bm25 behavior
+///
+#[rstest]
+#[case::clean(false)]
+#[case::churn(true)]
+#[tokio::test]
+async fn generated_group_by_aggregates(database: Db, #[case] churn_on: bool) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let table_name = "users";
+    let tables_and_sizes = [(table_name, 50)];
+    let setup_sql = generated_queries_setup(&pool, &tables_and_sizes, COLUMNS);
+    let setup_sql = churn_setup(&pool, setup_sql, &tables_and_sizes, COLUMNS, churn_on);
+
+    // Columns that can be used for grouping (must be columnar indexed)
+    let columns: Vec<_> = COLUMNS
+        .iter()
+        .filter(|col| col.is_groupable && col.is_whereable)
+        .cloned()
+        .collect();
+
+    let grouping_columns: Vec<_> = columns.iter().map(|col| col.name).collect();
+
+    proptest!(qgen_proptest_config(), |(
+        text_where_expr in arb_wheres(
+            vec![table_name],
+            &columns,
+        ),
+        numeric_where_expr in arb_wheres(
+            vec![table_name],
+            &columns_named(vec!["age", "price", "rating"]),
+        ),
+        group_by_expr in arb_group_by(grouping_columns.to_vec(), vec![
+            "COUNT(*)", "SUM(price)", "AVG(price)", "MIN(quantity)", "MAX(quantity)", "SUM(age)", "AVG(age)",
+            "COUNT(metadata->>'brand')",
+            "COUNT((metadata->>'rating')::bigint)",
+            "SUM((metadata->>'rating')::bigint)",
+            "AVG((metadata->>'rating')::bigint)",
+            "MIN((metadata->>'rating')::bigint)",
+            "MAX((metadata->>'rating')::bigint)",
+            "COUNT(COALESCE((metadata->>'rating')::bigint, 0))",
+            "SUM(COALESCE((metadata->>'rating')::bigint, -1))",
+            "SUM(COALESCE((metadata->>'rating')::bigint, 7))",
+            "SUM((metadata->'details'->>'score')::double precision)",
+            "AVG((metadata->'details'->>'score')::double precision)",
+            "MIN((metadata->'details'->>'score')::double precision)",
+            "MAX((metadata->'details'->>'score')::double precision)",
+            "AVG(COALESCE((metadata->'details'->>'score')::double precision, 1.5))",
+        ]),
+        limit in prop::option::of(5..21_usize),
+        offset in prop::option::of(0..4_usize),
+        gucs in any::<PgGucs>(),
+    )| {
+        let select_list = group_by_expr.to_select_list();
+        let group_by_clause = group_by_expr.to_sql();
+
+        let order_by_and_offset_clause: String = if group_by_expr.group_by_columns.is_empty() {
+            String::new()
+        } else {
+            let order_by_items: Vec<String> = group_by_expr.group_by_columns
+                .iter()
+                .map(|item| {format!("{item} ASC NULLS LAST")})
+                .collect();
+            // only apply OFFSET when there are grouping columns, otherwise
+            // we'd offset the single aggregate row
+            let offset_clause = offset
+                .map(|value| format!(" OFFSET {value}"))
+                .unwrap_or_default();
+
+            format!("ORDER BY {}{offset_clause}", order_by_items.join(", "))
+        };
+
+        let limit_clause = limit
+            .map(|value| format!(" LIMIT {value}"))
+            .unwrap_or_default();
+
+        // Create combined WHERE clause for PostgreSQL using = operator
+        let pg_where_clause = format!(
+            "({}) AND ({})",
+            text_where_expr.to_sql(" = "),
+            numeric_where_expr.to_sql(" < ")
+        );
+
+        // Create combined WHERE clause for BM25 using appropriate operators
+        let bm25_where_clause = format!(
+            "({}) AND ({})",
+            text_where_expr.to_sql("@@@"),
+            numeric_where_expr.to_sql(" < ")
+        );
+
+        let pg_query = format!(
+            "SELECT {select_list} FROM {table_name} WHERE {pg_where_clause} {group_by_clause} {order_by_and_offset_clause}{limit_clause}",
+        );
+
+        let bm25_query = format!(
+            "SELECT {select_list} FROM {table_name} WHERE {bm25_where_clause} {group_by_clause} {order_by_and_offset_clause}{limit_clause}",
+        );
+
+        // Custom result comparator for GROUP BY results
+        let compare_results =
+            |query: &str, _: QuerySide, conn: &mut PgConnection| -> Result<Vec<String>, sqlx::Error> {
+            // Fetch all rows as dynamic results and convert to string representation
+            let rows = query.fetch_dynamic_result(conn)?;
+            let string_rows: Vec<String> = rows
+                .into_iter()
+                .map(|row| {
+                    // Convert entire row to a string representation for comparison
+                    let mut row_string = String::new();
+                    for i in 0..row.len() {
+                        if i > 0 {
+                            row_string.push('|');
+                        }
+
+                        // Try to get value as different types, converting to string
+                        let value_str = if let Ok(val) = row.try_get::<i64, _>(i) {
+                            val.to_string()
+                        } else if let Ok(val) = row.try_get::<i32, _>(i) {
+                            val.to_string()
+                        } else if let Ok(val) = row.try_get::<sqlx::types::BigDecimal, _>(i) {
+                            format!("{val:.6}")
+                        } else if let Ok(val) = row.try_get::<f64, _>(i) {
+                            format!("{val:.6}")
+                        } else if let Ok(val) = row.try_get::<sqlx::types::Uuid, _>(i) {
+                            val.to_string()
+                        } else if let Ok(val) = row.try_get::<String, _>(i) {
+                            val
+                        } else {
+                            "NULL".to_string()
+                        };
+
+                        row_string.push_str(&value_str);
+                    }
+                    row_string
+                })
+                .collect();
+
+            Ok(string_rows)
+        };
+
+        qgen_oracle!("qgen: generated_group_by_aggregates - ParadeDB result matches PostgreSQL", compare_outcome_retrying(&pg_query, &bm25_query, &gucs, &pool, &setup_sql, compare_results))?;
+    });
+}
+
+#[rstest]
+#[tokio::test]
+async fn generated_paging_small(database: Db) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let table_name = "users";
+    let setup_sql = generated_queries_setup(&pool, &[(table_name, 1000)], COLUMNS);
+
+    proptest!(qgen_proptest_config(), |(
+        where_expr in arb_wheres(vec![table_name], &columns_named(vec!["name"])),
+        paging_exprs in arb_paging_exprs(table_name, vec!["name", "color", "age", "quantity", "uuid"], vec!["id"], 100),
+        gucs in any::<PgGucs>(),
+    )| {
+        qgen_oracle!("qgen: generated_paging_small - ParadeDB result matches PostgreSQL", compare_outcome_retrying(
+            &format!("SELECT id FROM {table_name} WHERE {} {paging_exprs}", where_expr.to_sql(" = ")),
+            &format!("SELECT id FROM {table_name} WHERE {} {paging_exprs}", where_expr.to_sql("@@@")),
+            &gucs,
+            &pool,
+            &setup_sql,
+            |query, _, conn| query.fetch_result::<(i64,)>(conn),
+        ))?;
+    });
+}
+
+/// Generates paging expressions on a large table, which was necessary to reproduce
+/// https://github.com/paradedb/tantivy/pull/51
+///
+/// TODO: Explore whether this could use https://github.com/paradedb/paradedb/pull/2681
+/// to use a large segment count rather than a large table size.
+#[rstest]
+#[tokio::test]
+async fn generated_paging_large(database: Db) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let table_name = "users";
+    let setup_sql = generated_queries_setup(&pool, &[(table_name, 100000)], COLUMNS);
+
+    proptest!(qgen_proptest_config(), |(
+        paging_exprs in arb_paging_exprs(table_name, vec![], vec!["uuid"], 100),
+        gucs in any::<PgGucs>(),
+    )| {
+        qgen_oracle!("qgen: generated_paging_large - ParadeDB result matches PostgreSQL", compare_outcome_retrying(
+            &format!("SELECT uuid::text FROM {table_name} WHERE name  =  'bob' {paging_exprs}"),
+            &format!("SELECT uuid::text FROM {table_name} WHERE name === 'bob' {paging_exprs}"),
+            &gucs,
+            &pool,
+            &setup_sql,
+            |query, _, conn| query.fetch_result::<(String,)>(conn),
+        ))?;
+    });
+}
+
+#[rstest]
+#[case::clean(false)]
+#[case::churn(true)]
+#[tokio::test]
+async fn generated_subquery(database: Db, #[case] churn_on: bool) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let outer_table_name = "products";
+    let inner_table_name = "orders";
+    let tables_and_sizes = [(outer_table_name, 10), (inner_table_name, 10)];
+    let setup_sql = generated_queries_setup(&pool, &tables_and_sizes, COLUMNS);
+    let setup_sql = churn_setup(&pool, setup_sql, &tables_and_sizes, COLUMNS, churn_on);
+
+    proptest!(qgen_proptest_config(), |(
+        outer_where_expr in arb_wheres(
+            vec![outer_table_name],
+            COLUMNS,
+        ),
+        inner_where_expr in arb_wheres(
+            vec![inner_table_name],
+            COLUMNS,
+        ),
+        // `rating` is not indexed, so its predicate runs as a heap filter.
+        subquery_column in proptest::sample::select(&["name", "color", "age", "rating"]),
+        subquery_kind in prop_oneof![Just(SubqueryKind::Exists), Just(SubqueryKind::In)],
+        subquery_polarity in prop_oneof![
+            Just(SubqueryPolarity::Positive),
+            Just(SubqueryPolarity::Negated),
+        ],
+        subquery_correlation in prop_oneof![
+            Just(SubqueryCorrelation::Var),
+            Just(SubqueryCorrelation::InitPlan),
+        ],
+        // Bounded by the inner table's size: an `OFFSET` past its rows makes the `EXISTS` false
+        // whatever the scan returns.
+        paging_exprs in arb_paging_exprs(inner_table_name, vec!["name", "color", "age", "uuid"], vec!["id"], tables_and_sizes[1].1),
+        mut gucs in any::<PgGucs>(),
+    )| {
+        // TODO(#6814): once Postgres pulls the EXISTS up into a semi join, the InitPlan form is a
+        // SubPlan in the join filter, which the DataFusion aggregate cannot evaluate ("SubPlan
+        // found with no parent plan").
+        if matches!(subquery_correlation, SubqueryCorrelation::InitPlan) {
+            gucs.aggregate_custom_scan = false;
+        }
+        let subquery = GeneratedSubquery {
+            kind: subquery_kind,
+            polarity: subquery_polarity,
+            correlation: subquery_correlation,
+            column: subquery_column,
+            inner_where_expr,
+            paging_exprs,
+        };
+
+        let pg = format!(
+            "SELECT COUNT(*) FROM {outer_table_name} \
+            WHERE {} AND {}",
+            subquery.to_sql(" = ", outer_table_name, inner_table_name),
+            outer_where_expr.to_sql(" = "),
+        );
+        let bm25 = format!(
+            "SELECT COUNT(*) FROM {outer_table_name} \
+            WHERE {} AND {}",
+            subquery.to_sql("@@@", outer_table_name, inner_table_name),
+            outer_where_expr.to_sql("@@@"),
+        );
+
+        qgen_oracle!("qgen: generated_subquery - ParadeDB result matches PostgreSQL", compare_outcome_retrying(
+            &pg,
+            &bm25,
+            &gucs,
+            &pool,
+            &setup_sql,
+            |query, _, conn| query.fetch_one_result::<(i64,)>(conn),
+        ))?;
+    });
+}
+
+/// Property test for aggregate-on-join via DataFusion: ensures equivalence between
+/// PostgreSQL native aggregation and ParadeDB's DataFusion aggregate backend.
+///
+/// This test randomly combines:
+/// - 2 or 3 table INNER, LEFT, or FULL joins (equi, non-equi, and mixed conditions)
+/// - BM25 predicates (@@@ on outer table)
+/// - GROUP BY with 0-2 grouping columns across all joined tables (including JSONB projections)
+/// - Regular, statistical, and DISTINCT aggregates: COUNT(*), SUM, AVG, MIN, MAX, STDDEV,
+///   VARIANCE, COUNT(DISTINCT), SUM(DISTINCT), AVG(DISTINCT) across all joined tables
+/// - Optional HAVING clauses
+///
+/// Verifies both plan selection (`DataFusion Physical Plan` when at least one join
+/// step survives PostgreSQL's `remove_useless_joins`, or single-table `ParadeDB Aggregate Scan`
+/// when all steps collapse and no HAVING / DISTINCT / STDDEV / VARIANCE aggregate declines
+/// Tantivy) and result equivalence against PostgreSQL's native aggregation.
+#[rstest]
+#[case::clean(false)]
+#[case::churn(true)]
+#[tokio::test]
+async fn generated_aggregate_join(database: Db, #[case] churn_on: bool) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    // Three tables for 2-way and 3-way join testing
+    let tables_and_sizes = [("users", 50), ("products", 50), ("orders", 50)];
+    let all_tables: Vec<&str> = tables_and_sizes.iter().map(|(table, _)| *table).collect();
+    let setup_sql = generated_queries_setup(&pool, &tables_and_sizes, COLUMNS);
+    let setup_sql = churn_setup(&pool, setup_sql, &tables_and_sizes, COLUMNS, churn_on);
+
+    // Text columns for BM25 WHERE clauses
+    let text_columns = columns_named(vec!["name"]);
+    // Columns for join keys
+    let join_key_columns = columns_named(vec!["id", "age"]);
+    // Base column names for GROUP BY (must be columnar fast fields)
+    let base_grouping_cols: Vec<&str> = COLUMNS
+        .iter()
+        .filter(|col| col.is_groupable && col.is_whereable)
+        .map(|col| col.name)
+        .collect();
+
+    proptest!(qgen_proptest_config(), |(
+        (join_expr, group_by_expr) in (2..=3usize).prop_flat_map(|num_tables| {
+            let tables_for_join = all_tables[..num_tables].to_vec();
+            let base_grouping_cols = base_grouping_cols.clone();
+            arb_joins(
+                prop_oneof![Just(JoinType::Inner), Just(JoinType::Left), Just(JoinType::Full)],
+                tables_for_join,
+                &join_key_columns,
+            )
+            .prop_flat_map(move |join_expr| {
+                let used_tables = join_expr.used_tables();
+                let mut grouping_columns = Vec::new();
+                let mut aggregates = vec!["COUNT(*)".to_string()];
+                for table in &used_tables {
+                    for col in &base_grouping_cols {
+                        grouping_columns.push(format!("{table}.{col}"));
+                    }
+                    // Group by text and JSONB representations
+                    grouping_columns.push(format!("{table}.metadata->>'brand'"));
+                    grouping_columns.push(format!("{table}.metadata->'brand'"));
+                    aggregates.extend([
+                        format!("SUM({table}.age)"),
+                        format!("AVG({table}.age)"),
+                        format!("MIN({table}.quantity)"),
+                        format!("MAX({table}.quantity)"),
+                        format!("STDDEV({table}.age)"),
+                        format!("VARIANCE({table}.age)"),
+                        format!("COUNT(DISTINCT {table}.age)"),
+                        format!("SUM(DISTINCT {table}.age)"),
+                        format!("AVG(DISTINCT {table}.age)"),
+                    ]);
+                }
+                (
+                    Just(join_expr),
+                    arb_group_by(grouping_columns, aggregates),
+                )
+            })
+        }),
+        // Outer table BM25 predicate
+        outer_bm25 in arb_wheres(vec![all_tables[0]], &text_columns),
+        mut gucs in any::<PgGucs>(),
+    )| {
+        let join_clause = join_expr.to_sql();
+        let select_list = group_by_expr.to_select_list();
+        let group_by_clause = group_by_expr.to_sql();
+
+        // Build WHERE clauses
+        let bm25_where = outer_bm25.to_sql("@@@");
+        let pg_where = outer_bm25.to_sql(" = ");
+
+        // PostgreSQL native query
+        let pg_query = format!(
+            "SELECT {select_list} {join_clause} WHERE {pg_where} {group_by_clause}"
+        );
+
+        // BM25 query with aggregate custom scan enabled
+        let bm25_query = format!(
+            "SELECT {select_list} {join_clause} WHERE {bm25_where} {group_by_clause}"
+        );
+
+        // GUCs: enable both join and aggregate custom scans
+        gucs.aggregate_custom_scan = true;
+        gucs.join_custom_scan = true;
+        gucs.custom_scan = true;
+
+        // Check whether PostgreSQL's `reduce_outer_joins` and `remove_useless_joins` prune
+        // every joined table, reducing the query from a join (`RELOPT_JOINREL`) to a
+        // single-table scan (`RELOPT_BASEREL`) on `users`.
+        let collapses_to_single_table = join_expr.collapses_to_single_table(
+            outer_bm25.forces_nonnullable(),
+            |table| {
+                let prefix = format!("{table}.");
+                select_list.contains(&prefix) || group_by_clause.contains(&prefix)
+            },
+        );
+
+        let expected_plan: Option<&[&str]> = if !collapses_to_single_table {
+            Some(&["DataFusion Physical Plan"])
+        } else if group_by_expr.having.is_none()
+            && !select_list.contains("DISTINCT")
+            && !select_list.contains("STDDEV(")
+            && !select_list.contains("VARIANCE(")
+        {
+            Some(&["ParadeDB Aggregate Scan"])
+        } else {
+            None
+        };
+
+        if let Some(expected_plan) = expected_plan {
+            qgen_oracle!(
+                "qgen: generated_aggregate_join - ParadeDB aggregate custom scan planned",
+                compare_plan_retrying(
+                    &pg_query,
+                    &bm25_query,
+                    &gucs,
+                    &pool,
+                    &setup_sql,
+                    expected_plan,
+                    &[],
+                )
+            )?;
+        }
+
+        qgen_oracle!("qgen: generated_aggregate_join - ParadeDB result matches PostgreSQL", compare_outcome_retrying(
+            &pg_query,
+            &bm25_query,
+            &gucs,
+            &pool,
+            &setup_sql,
+            |query, _, conn| {
+                let rows = query.fetch_dynamic_result(conn)?;
+                let mut string_rows: Vec<String> = rows
+                    .into_iter()
+                    .map(|row| {
+                        let mut row_string = String::new();
+                        for i in 0..row.len() {
+                            if i > 0 {
+                                row_string.push('|');
+                            }
+                            let value_str = if let Ok(val) = row.try_get::<i64, _>(i) {
+                                val.to_string()
+                            } else if let Ok(val) = row.try_get::<i32, _>(i) {
+                                val.to_string()
+                            } else if let Ok(val) = row.try_get::<sqlx::types::BigDecimal, _>(i) {
+                                format!("{val:.6}")
+                            } else if let Ok(val) = row.try_get::<f64, _>(i) {
+                                format!("{val:.6}")
+                            } else if let Ok(val) = row.try_get::<sqlx::types::Uuid, _>(i) {
+                                val.to_string()
+                            } else if let Ok(val) = row.try_get::<serde_json::Value, _>(i) {
+                                val.to_string()
+                            } else if let Ok(val) = row.try_get::<String, _>(i) {
+                                val
+                            } else {
+                                "NULL".to_string()
+                            };
+                            row_string.push_str(&value_str);
+                        }
+                        row_string
+                    })
+                    .collect();
+                string_rows.sort();
+                Ok(string_rows)
+            },
+        ))?;
+    });
+}
+
+///
+/// Property test for numeric pushdown - ensures equivalence between PostgreSQL and BM25 behavior
+/// for numeric comparison operators (=, <, <=, >, >=, BETWEEN).
+///
+/// Tests both Numeric64 (precision <= 18) and NumericBytes (unlimited precision) storage types.
+///
+#[rstest]
+#[tokio::test]
+async fn generated_numeric_pushdown(database: Db) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let table_name = "users";
+    // Use more rows to get better coverage of value ranges
+    let setup_sql = generated_queries_setup(&pool, &[(table_name, 100)], COLUMNS);
+
+    // Numeric columns for testing - includes both Numeric64 and NumericBytes storage types
+    let numeric_columns = columns_named(vec![
+        "price",         // NUMERIC(10,2) - Numeric64
+        "small_numeric", // NUMERIC(5,2) - Numeric64
+        "int_numeric",   // NUMERIC(10,0) - Numeric64 (integer-like)
+        "high_scale",    // NUMERIC(18,6) - Numeric64 with high scale
+        "big_numeric",   // NUMERIC - NumericBytes (unlimited precision)
+        "age",           // INTEGER - for comparison
+    ]);
+
+    proptest!(qgen_proptest_config(), |(
+        numeric_expr in arb_numeric_expr(vec![table_name], &numeric_columns),
+        gucs in any::<PgGucs>(),
+    )| {
+        // Both queries use the same SQL since numeric comparison operators
+        // are handled identically - the pushdown happens internally in BM25
+        let where_clause = numeric_expr.to_sql();
+
+        // We need a BM25 predicate to trigger the custom scan
+        // Use an OR clause to match all possible name values in the test data
+        let bm25_predicate = format!(
+            "{table_name}.name @@@ pdb.all()"
+        );
+
+        // PostgreSQL query: uses only the numeric predicate
+        let pg_query = format!(
+            "SELECT id FROM {table_name} WHERE {where_clause} ORDER BY id"
+        );
+
+        // BM25 query: combines BM25 predicate with numeric pushdown
+        let bm25_query = format!(
+            "SELECT id FROM {table_name} WHERE {bm25_predicate} AND {where_clause} ORDER BY id"
+        );
+
+        qgen_oracle!("qgen: generated_numeric_pushdown - ParadeDB result matches PostgreSQL", compare_outcome_retrying(
+            &pg_query,
+            &bm25_query,
+            &gucs,
+            &pool,
+            &setup_sql,
+            |query, _, conn| {
+                let mut rows = query.fetch_result::<(i64,)>(conn)?;
+                rows.sort();
+                Ok(rows)
+            },
+        ))?;
+    });
+}
+
+///
+/// Property test for JoinScan SEMI and ANTI joins.
+///
+/// Fuzzes between:
+/// - SEMI join via `IN (SELECT ...)` subquery
+/// - ANTI join via `NOT EXISTS (SELECT ... WHERE correlated)` with `IS NOT NULL`
+///
+/// PostgreSQL only triggers an anti join plan with `NOT EXISTS`, not `NOT IN`
+/// (due to NULL semantics). An `IS NOT NULL` condition on the join column is
+/// also required for the anti join optimization.
+///
+/// This complements `generated_joins_small` and verifies both:
+/// - `paradedb.enable_join_custom_scan = false`: no ParadeDB Join Scan is used
+/// - `paradedb.enable_join_custom_scan = true`: ParadeDB Join Scan is used
+#[rstest]
+#[tokio::test]
+async fn generated_join_semi_like(database: Db) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    // Use varied table sizes to test both when the left side is the largest source
+    // and when the right side is the largest source (which now forces the partition
+    // to the left side anyway for SEMI/ANTI correctness).
+    let tables_and_sizes = [
+        ("users", 500),
+        ("products", 120),
+        ("orders", 40),
+        ("logs", 1000),
+    ];
+    let setup_sql = generated_queries_setup(&pool, &tables_and_sizes, COLUMNS);
+
+    let all_tables = vec!["users", "products", "orders", "logs"];
+    let join_key_columns = vec!["id", "age", "uuid"];
+    let search_terms = vec![
+        "alice", "bob", "cloe", "sally", "brandy", "brisket", "anchovy",
+    ];
+
+    proptest!(qgen_proptest_config(), |(
+        semi_join in arb_semi_joins(all_tables.clone(), join_key_columns.clone()),
+        inner_term in proptest::sample::select(search_terms.clone()),
+        is_anti_join in proptest::bool::ANY,
+        limit in 1..=50usize,
+        nested_join in proptest::option::of(arb_semi_joins(all_tables.clone(), join_key_columns.clone())),
+        nested_term in proptest::sample::select(search_terms.clone()),
+        nested_is_anti in proptest::bool::ANY,
+        gucs in any::<PgGucs>(),
+    )| {
+        let outer = semi_join.outer_table();
+        let inner = semi_join.inner_table();
+        let join_col = semi_join.join_column();
+
+        // Skip nested cases where the nested inner table collides with the outer tables,
+        // since that would create a self-join which changes the semantics.
+        let nested = nested_join.as_ref().and_then(|nj| {
+            let nested_inner = nj.inner_table();
+            if nested_inner != outer && nested_inner != inner
+                && nj.outer_table() != nj.inner_table()
+            {
+                Some((nj, &nested_term, nested_is_anti))
+            } else {
+                None
+            }
+        });
+
+        // Build the subquery clause parameterized by operator.
+        // SEMI: IN (SELECT ...), ANTI: IS NOT NULL AND NOT EXISTS (SELECT 1 ... WHERE correlated)
+        // PostgreSQL only uses an anti join plan with NOT EXISTS (not NOT IN) and
+        // requires IS NOT NULL on the join column.
+        let subquery_clause = |op: &str| {
+            let nested_clause = if let Some((nj, nterm, nis_anti)) = &nested {
+                let mid = inner;
+                let deep = nj.inner_table();
+                let ncol = nj.join_column();
+                if *nis_anti {
+                    format!(
+                        " AND {mid}.{ncol} IS NOT NULL AND NOT EXISTS (\
+                            SELECT 1 FROM {deep} \
+                            WHERE {deep}.{ncol} = {mid}.{ncol} \
+                            AND {deep}.name {op} '{nterm}'\
+                        )"
+                    )
+                } else {
+                    format!(
+                        " AND {mid}.{ncol} IN (\
+                            SELECT {deep}.{ncol} FROM {deep} \
+                            WHERE {deep}.name {op} '{nterm}'\
+                        )"
+                    )
+                }
+            } else {
+                String::new()
+            };
+
+            if is_anti_join {
+                format!(
+                    "{outer}.{join_col} IS NOT NULL AND NOT EXISTS (\
+                        SELECT 1 FROM {inner} \
+                        WHERE {inner}.{join_col} = {outer}.{join_col} \
+                        AND {inner}.name {op} '{inner_term}'\
+                        {nested_clause}\
+                    )"
+                )
+            } else {
+                format!(
+                    "{outer}.{join_col} IN (\
+                        SELECT {inner}.{join_col} FROM {inner} \
+                        WHERE {inner}.name {op} '{inner_term}'\
+                        {nested_clause}\
+                    )"
+                )
+            }
+        };
+
+        let pg_where = format!("TRUE AND {}", subquery_clause(" = "));
+        let bm25_where = format!("{outer}.id @@@ pdb.all() AND {}", subquery_clause("@@@"));
+
+        let pg_query = format!(
+            "SELECT {outer}.id, {outer}.name \
+             FROM {outer} \
+             WHERE {pg_where} \
+             ORDER BY {outer}.id \
+             LIMIT {limit}"
+        );
+        let bm25_query = format!(
+            "SELECT {outer}.id, {outer}.name \
+             FROM {outer} \
+             WHERE {bm25_where} \
+             ORDER BY {outer}.id \
+             LIMIT {limit}"
+        );
+
+        qgen_oracle!("qgen: generated_joinscan_semi_like - ParadeDB result matches PostgreSQL", compare_outcome_retrying(
+            &pg_query,
+            &bm25_query,
+            &gucs,
+            &pool,
+            &setup_sql,
+            |query, _, conn| query.fetch_result::<(i64, String)>(conn),
+        ))?;
+    });
+}
+
+///
+/// Property test for numeric precision preservation.
+///
+/// Tests that high-precision numeric values (which would lose precision if converted to f64)
+/// are correctly matched in BM25 queries. This specifically tests the Numeric64 storage
+/// type with values that have more than 15-16 significant digits (f64's precision limit).
+///
+/// Example: 123456789012345678 and 123456789012345679 are distinct in NUMERIC(18,0)
+/// but would be indistinguishable if converted to f64.
+///
+#[rstest]
+#[tokio::test]
+async fn generated_numeric_precision(database: Db) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let table_name = "precision_test";
+
+    // Custom setup for precision testing - uses NUMERIC(18,0) which stores as Numeric64
+    // but with values that exceed f64's precision
+    let precision_columns: &[Column] = &[
+        Column::new("id", "SERIAL8", "'1'")
+            .primary_key()
+            .groupable(true),
+        Column::new("name", "TEXT", "'test'")
+            .index_expression(IndexExpression::Literal)
+            .random_generator_sql("'test'"),
+        Column::new("big_int", "NUMERIC(18,0)", "'123456789012345678'")
+            .groupable(false)
+            // Generate high-precision values that differ only in lower digits
+            // These values would collide if converted to f64
+            .random_generator_sql(
+                "(ARRAY [123456789012345678, 123456789012345679, 123456789012345680, 999999999999999998, 999999999999999999]::numeric[])[(floor(random() * 5) + 1)::int]"
+            ),
+    ];
+
+    let setup_sql = generated_queries_setup(&pool, &[(table_name, 50)], precision_columns);
+
+    // High-precision test values that would be indistinguishable in f64
+    let precision_test_values = vec![
+        "123456789012345678",
+        "123456789012345679",
+        "123456789012345680",
+        "999999999999999998",
+        "999999999999999999",
+    ];
+
+    proptest!(qgen_proptest_config(), |(
+        test_value in proptest::sample::select(precision_test_values),
+        gucs in any::<PgGucs>(),
+    )| {
+        // PostgreSQL query - should find exact matches only
+        let pg_query = format!(
+            "SELECT COUNT(*) FROM {table_name} WHERE big_int = {test_value}"
+        );
+
+        // BM25 query - should produce identical results
+        // Use 'test' as the name value since all rows have name = 'test'
+        let bm25_query = format!(
+            "SELECT COUNT(*) FROM {table_name} WHERE name === 'test' AND big_int = {test_value}"
+        );
+
+        qgen_oracle!("qgen: generated_numeric_precision - ParadeDB result matches PostgreSQL", compare_outcome_retrying(
+            &pg_query,
+            &bm25_query,
+            &gucs,
+            &pool,
+            &setup_sql,
+            |query, _, conn| Ok(query.fetch_one_result::<(i64,)>(conn)?.0),
+        ))?;
+    });
+}
+
+///
+/// Property test for numeric range queries with precision preservation.
+///
+/// Tests that range queries (>, <, >=, <=, BETWEEN) on high-precision numeric values
+/// produce correct results without precision loss.
+///
+#[rstest]
+#[tokio::test]
+async fn generated_numeric_range_precision(database: Db) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let table_name = "range_precision_test";
+
+    // Custom setup for range precision testing
+    let precision_columns: &[Column] = &[
+        Column::new("id", "SERIAL8", "'1'")
+            .primary_key()
+            .groupable(true),
+        Column::new("name", "TEXT", "'test'")
+            .index_expression(IndexExpression::Literal)
+            .random_generator_sql("'test'"),
+        Column::new("big_int", "NUMERIC(18,0)", "'100'")
+            .groupable(false)
+            // Generate sequential high-precision values
+            .random_generator_sql("(floor(random() * 100) + 123456789012345600)::numeric(18,0)"),
+    ];
+
+    let setup_sql = generated_queries_setup(&pool, &[(table_name, 100)], precision_columns);
+
+    // Range boundaries that would collide in f64
+    let range_bounds = vec![
+        ("123456789012345650", "123456789012345660"),
+        ("123456789012345670", "123456789012345680"),
+        ("123456789012345690", "123456789012345700"),
+    ];
+
+    proptest!(qgen_proptest_config(), |(
+        (low, high) in proptest::sample::select(range_bounds),
+        gucs in any::<PgGucs>(),
+    )| {
+        // PostgreSQL query - range filter
+        let pg_query = format!(
+            "SELECT COUNT(*) FROM {table_name} WHERE big_int >= {low} AND big_int < {high}"
+        );
+
+        // BM25 query - should produce identical results
+        // Use 'test' as the name value since all rows have name = 'test'
+        let bm25_query = format!(
+            "SELECT COUNT(*) FROM {table_name} WHERE name === 'test' AND big_int >= {low} AND big_int < {high}"
+        );
+
+        qgen_oracle!("qgen: generated_numeric_range_precision - ParadeDB result matches PostgreSQL", compare_outcome_retrying(
+            &pg_query,
+            &bm25_query,
+            &gucs,
+            &pool,
+            &setup_sql,
+            |query, _, conn| Ok(query.fetch_one_result::<(i64,)>(conn)?.0),
+        ))?;
+    });
+}
+
+/// Property test for `pdb.agg()` over joins: the buckets and metrics the DataFusion backend
+/// assembles must equal the rows of the equivalent SQL `GROUP BY` run by PostgreSQL, which is
+/// the oracle since `pdb.agg()` itself has no native fallback. Covers nested `terms`, a
+/// `size` cut under the default count order, NULL buckets, NUMERIC metrics, `cardinality`,
+/// a SQL `GROUP BY` beside the call, and MPP when the parallel GUCs are on.
+/// TODO: Consider merging this property test with `generated_aggregate_join` in the future.
+#[rstest]
+#[tokio::test]
+async fn generated_pdb_agg_join(database: Db) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let tables_and_sizes = [("users", 50), ("products", 50), ("orders", 50)];
+    let all_tables: Vec<String> = tables_and_sizes
+        .iter()
+        .map(|(table, _)| table.to_string())
+        .collect();
+    let setup_sql = generated_queries_setup(&pool, &tables_and_sizes, COLUMNS);
+
+    let where_columns = columns_named(vec!["name", "color"]);
+    let join_key_columns = columns_named(vec!["id", "age"]);
+
+    proptest!(qgen_proptest_config(), |(
+        (join_expr, agg, wheres) in arb_pdb_agg_join(all_tables.clone(), &join_key_columns, &where_columns),
+        mut gucs in any::<PgGucs>(),
+    )| {
+        let join_clause = join_expr.to_sql();
+        let pg_query = agg.pg_query(&join_clause, &wheres.pg_where());
+        let bm25_query = agg.pdb_query(&join_clause, &wheres.bm25_where());
+
+        // `pdb.agg()` over a join only runs on the DataFusion backend.
+        gucs.aggregate_custom_scan = true;
+        gucs.join_custom_scan = true;
+        gucs.custom_scan = true;
+
+        let pg_outer_query = agg.pg_outer_query(&join_clause, &wheres.pg_where());
+        if agg.combine_across_groups {
+            qgen_oracle!(
+                "qgen: generated_pdb_agg_join - ParadeDB Aggregate Scan planned for pdb.combine_agg",
+                compare_plan_retrying(
+                    &pg_outer_query,
+                    &bm25_query,
+                    &gucs,
+                    &pool,
+                    &setup_sql,
+                    &["ParadeDB Aggregate Scan"],
+                    &["WindowAgg"],
+                )
+            )?;
+        }
+
+        if agg.combine_across_groups || !agg.outer_aggs.is_empty() {
+            qgen_oracle!(
+                "qgen: generated_pdb_agg_join - outer aggregates match PostgreSQL",
+                compare_outcome_retrying(
+                    &pg_outer_query,
+                    &bm25_query,
+                    &gucs,
+                    &pool,
+                    &setup_sql,
+                    |query, side, conn| {
+                        "SET work_mem TO '64MB';".execute_result(conn)?;
+                        let rows = query.fetch_dynamic_result(conn)?;
+                        let mut outer = agg.outer_rows(rows, side.is_candidate())?;
+                        if agg.group_limit.is_none() {
+                            outer.sort();
+                        }
+                        Ok(outer)
+                    },
+                )
+            )?;
+        }
+
+        let baseline_query = if agg.combine_across_groups {
+            &pg_outer_query
+        } else {
+            &pg_query
+        };
+        qgen_oracle!(
+            "qgen: generated_pdb_agg_join - pdb.agg() buckets match PostgreSQL GROUP BY",
+            compare_outcome_retrying(
+                baseline_query,
+                &bm25_query,
+                &gucs,
+                &pool,
+                &setup_sql,
+                |query, side, conn| {
+                    // A keyless join under three bucket keys makes tens of thousands of
+                    // buckets, and the DataFusion aggregate cannot spill past `work_mem`.
+                    "SET work_mem TO '64MB';".execute_result(conn)?;
+                    let rows = query.fetch_dynamic_result(conn)?;
+                    let mut buckets = if agg.combine_across_groups {
+                        if rows.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        if side.is_candidate() {
+                            agg.window_rows(&rows)?
+                        } else {
+                            agg.rows(pg_query.as_str().fetch_dynamic_result(conn)?)?
+                        }
+                    } else {
+                        agg.rows(rows)?
+                    };
+                    buckets.sort();
+                    Ok(buckets)
+                },
+            )
+        )?;
+    });
+}
+
+/// The same single-table `pdb.agg()` answered by Tantivy and by DataFusion. The documents must
+/// be equal as they are: bucket order, `sum_other_doc_count`, NULL buckets, and metric values
+/// alike. A grouped query sorted by an aggregate under a `LIMIT` is routed to DataFusion whatever
+/// the planner's group estimate, and the limit sits above any group count, so it cuts nothing.
+#[rstest]
+#[tokio::test]
+async fn generated_pdb_agg_single_table(database: Db) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let setup_sql = generated_queries_setup(&pool, &[("users", 50)], COLUMNS);
+    let text_columns = columns_named(vec!["name"]);
+
+    proptest!(qgen_proptest_config(), |(
+        outer_bm25 in arb_wheres(vec!["users".to_string()], &text_columns),
+        agg in arb_pdb_agg_single_table(),
+        mut gucs in any::<PgGucs>(),
+    )| {
+        let group = agg.outer_group.as_deref().expect("a single-table spec sits beside a GROUP BY");
+        let where_bm25 = outer_bm25.to_sql("@@@");
+        let (tantivy_query, datafusion_query) = if agg.combine_across_groups {
+            let tantivy = format!("SELECT {} FROM users WHERE {where_bm25}", agg.call());
+            let df = format!(
+                "SELECT {group}, COUNT(*), COUNT(*) OVER (), pdb.combine_agg({}) OVER () \
+                 FROM users WHERE {where_bm25} GROUP BY {group} \
+                 ORDER BY COUNT(*) DESC, {group} ASC NULLS LAST LIMIT 10",
+                agg.call()
+            );
+            (tantivy, df)
+        } else {
+            let tantivy = format!(
+                "SELECT {group}, COUNT(*), {} FROM users WHERE {where_bm25} GROUP BY {group}",
+                agg.call(),
+            );
+            let df = format!("{tantivy} ORDER BY COUNT(*) DESC LIMIT 1000");
+            (tantivy, df)
+        };
+
+        gucs.aggregate_custom_scan = true;
+        gucs.custom_scan = true;
+        let sides = Sides {
+            baseline: gucs.set(),
+            candidate: gucs.set(),
+        };
+
+        // A spec that doesn't lower leaves the candidate on Tantivy too, and the comparison
+        // below would then prove nothing.
+        qgen_oracle!("qgen: generated_pdb_agg_single_table - candidate runs on DataFusion", compare_plan_retrying_on(
+            &sides,
+            &tantivy_query,
+            &datafusion_query,
+            &pool,
+            &setup_sql,
+            &["DataFusion Physical Plan"],
+            &["WindowAgg"],
+        ))?;
+
+        let group_check_query = format!(
+            "SELECT 1 FROM users WHERE {where_bm25} GROUP BY {group} LIMIT 1"
+        );
+        qgen_oracle!("qgen: generated_pdb_agg_single_table - both backends answer pdb.agg() alike", compare_outcome_retrying_on(
+            &sides,
+            &tantivy_query,
+            &datafusion_query,
+            &pool,
+            &setup_sql,
+            |query, side, conn| {
+                if agg.combine_across_groups {
+                    if !side.is_candidate() {
+                        let has_groups = !group_check_query.as_str().fetch_dynamic_result(conn)?.is_empty();
+                        if !has_groups {
+                            return Ok(Vec::new());
+                        }
+                        let rows = query.fetch_dynamic_result(conn)?;
+                        let doc: serde_json::Value = rows[0].try_get(0)?;
+                        return Ok(vec![(String::new(), doc)]);
+                    }
+                    let rows = query.fetch_dynamic_result(conn)?;
+                    if rows.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let docs = agg.documents(rows)?;
+                    let first = docs[0].1.clone();
+                    for (_, doc) in &docs[1..] {
+                        if *doc != first {
+                            return Err(sqlx::Error::Protocol(
+                                "pdb.combine_agg(pdb.agg()) OVER () rows carry different documents".into(),
+                            ));
+                        }
+                    }
+                    Ok(vec![(String::new(), first)])
+                } else {
+                    let mut documents = agg.documents(query.fetch_dynamic_result(conn)?)?;
+                    documents.sort_by(|a, b| a.0.cmp(&b.0));
+                    Ok(documents)
+                }
+            },
+        ))?;
+    });
+}
+
+/// Property test for top-K scored and fast-field-ordered joins comparing `HashJoinExec`
+/// (`paradedb.enable_rank_join = off`) against `RankJoinExec` (`paradedb.enable_rank_join = on`,
+/// `paradedb.rank_join_min_rows = 0`).
+#[rstest]
+#[tokio::test]
+async fn generated_rank_join(database: Db) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let tables_and_sizes = [("users", 40), ("products", 40), ("orders", 40)];
+    let all_tables: Vec<String> = tables_and_sizes
+        .iter()
+        .map(|(table, _)| table.to_string())
+        .collect();
+    let setup_sql = generated_queries_setup(&pool, &tables_and_sizes, COLUMNS);
+    let where_columns = columns_named(vec!["name", "color"]);
+    let join_key_columns = columns_named(vec!["id", "age", "name", "price", "big_numeric", "uuid"]);
+
+    let join_and_where_strategy = (2..=all_tables.len()).prop_flat_map(move |num_tables| {
+        let joined = all_tables[..num_tables].to_vec();
+        let table_wheres: Vec<_> = joined
+            .iter()
+            .map(|t| arb_wheres(vec![t.clone()], &where_columns).boxed())
+            .collect();
+        let extra_base_where =
+            proptest::option::of(arb_wheres(vec![joined[0].clone()], &where_columns));
+        (
+            arb_joins(Just(JoinType::Inner), joined.clone(), &join_key_columns),
+            table_wheres,
+            extra_base_where,
+            arb_joinscan_order_parts(joined, false),
+        )
+    });
+
+    proptest!(qgen_proptest_config(), |(
+        (join, table_wheres, extra_base_where, mut order_parts) in join_and_where_strategy,
+        disjunctive in proptest::bool::ANY,
+        scored_tables in prop_oneof![Just(0usize), Just(1usize), Just(usize::MAX)],
+        multiply_scores in proptest::bool::ANY,
+        descending in proptest::bool::ANY,
+        limit in 1..=25usize,
+        offset in 0..=10usize,
+        mut gucs in any::<PgGucs>(),
+    )| {
+        let join_clause = join.to_sql();
+        let used_tables = join.used_tables();
+        let first_table = used_tables[0];
+
+        let where_sep = if disjunctive { " OR " } else { " AND " };
+        let where_clauses = table_wheres
+            .iter()
+            .map(|w| format!("({})", w.to_sql("@@@")))
+            .collect::<Vec<_>>()
+            .join(where_sep);
+        let where_bm25 = match &extra_base_where {
+            Some(base_w) => format!("({}) AND ({where_clauses})", base_w.to_sql("@@@")),
+            None => where_clauses,
+        };
+
+        // Disjunctive score joins require scoring all tables; conjunctive joins also test
+        // single-sided score (`scored_tables == 1`) and fast-field (`scored_tables == 0`) sorts.
+        let n_scored = if disjunctive {
+            used_tables.len()
+        } else {
+            scored_tables.min(used_tables.len())
+        };
+        let dir = if descending { "DESC" } else { "ASC" };
+        let score_sep = if !disjunctive && multiply_scores {
+            " * "
+        } else {
+            " + "
+        };
+        let lead_order = if n_scored == 0 {
+            format!("{first_table}.quantity {dir}")
+        } else {
+            let combined = used_tables[..n_scored]
+                .iter()
+                .map(|t| format!("pdb.score({t}.id)"))
+                .collect::<Vec<_>>()
+                .join(score_sep);
+            format!("{combined} {dir}")
+        };
+        order_parts.insert(0, lead_order);
+        let order_by = order_parts.join(", ");
+
+        let bm25_query = format!(
+            "SELECT {first_table}.id, {first_table}.name {join_clause} \
+             WHERE {where_bm25} \
+             ORDER BY {order_by} \
+             LIMIT {limit} OFFSET {offset}"
+        );
+
+        gucs.join_custom_scan = true;
+        gucs.custom_scan = true;
+
+        let base_gucs = gucs.set();
+        let sides = Sides {
+            baseline: format!("{base_gucs}SET paradedb.enable_rank_join TO off;\n"),
+            candidate: format!(
+                "{base_gucs}SET paradedb.enable_rank_join TO on;\n\
+                 SET paradedb.rank_join_min_rows TO 0;\n"
+            ),
+        };
+
+        qgen_oracle!(
+            "qgen: generated_rank_join - RankJoinExec matches HashJoinExec",
+            compare_outcome_retrying_on(
+                &sides,
+                &bm25_query,
+                &bm25_query,
+                &pool,
+                &setup_sql,
+                |query, _, conn| query.fetch_result::<(i64, String)>(conn),
+            )
+        )?;
+
+        if !join.has_keyless_step()
+            && !join_clause.contains(" AND ")
+            && !join_clause.contains(".name =")
+            && !join_clause.contains(".big_numeric =")
+            && extra_base_where.is_none()
+            && (n_scored == 0 || descending)
+            && !gucs.parallel_workers
+            && table_wheres
+                .iter()
+                .all(|w| matches!(w, WhereExpr::Atom { is_indexed: true, .. }))
+        {
+            qgen_oracle!(
+                "qgen: generated_rank_join - RankJoinExec planned",
+                compare_plan_retrying_on(
+                    &sides,
+                    &bm25_query,
+                    &bm25_query,
+                    &pool,
+                    &setup_sql,
+                    &["RankJoinExec"],
+                    &[],
+                )
+            )?;
+        }
+    });
+}

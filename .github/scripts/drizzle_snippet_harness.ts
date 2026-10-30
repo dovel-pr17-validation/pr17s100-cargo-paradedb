@@ -1,0 +1,117 @@
+const docsIndexes: { table: string; build: (table: any) => any }[] = [];
+import { drizzle as drizzlePostgres } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+import {
+  boolean as pgBoolean,
+  customType as pgCustomType,
+  jsonb as pgJsonb,
+  integer as pgInteger,
+  pgTable as definePgTable,
+  serial as pgSerial,
+  text as pgText,
+  timestamp as pgTimestamp,
+  varchar as pgVarchar,
+  vector as pgVector,
+} from "drizzle-orm/pg-core";
+
+const connectionString =
+  process.env.DATABASE_URL ??
+  "postgres://postgres:postgres@localhost:5432/postgres";
+
+const client = postgres(connectionString);
+const db = drizzlePostgres({ client });
+
+const int4range = pgCustomType({
+  dataType() {
+    return "int4range";
+  },
+});
+
+const mockItems = definePgTable(
+  "mock_items",
+  {
+    id: pgInteger("id").primaryKey(),
+    description: pgText("description"),
+    rating: pgInteger("rating"),
+    category: pgVarchar("category", { length: 255 }),
+    inStock: pgBoolean("in_stock"),
+    createdAt: pgTimestamp("created_at"),
+    metadata: pgJsonb("metadata"),
+    weightRange: int4range("weight_range"),
+    embedding: pgVector("embedding", { dimensions: 8 }),
+  },
+  (table) =>
+    docsIndexes
+      .filter((index) => index.table === "mock_items")
+      .map((index) => index.build(table)),
+);
+
+const orders = definePgTable("orders", {
+  orderId: pgInteger("order_id").primaryKey(),
+  productId: pgInteger("product_id").notNull(),
+  customerName: pgVarchar("customer_name", { length: 255 }).notNull(),
+});
+
+const arrayDemo = definePgTable(
+  "array_demo",
+  {
+    id: pgSerial("id").primaryKey(),
+    categories: pgText("categories").array(),
+  },
+  (table) =>
+    docsIndexes
+      .filter((index) => index.table === "array_demo")
+      .map((index) => index.build(table)),
+);
+
+const mockItemsGeo = definePgTable("mock_items_geo", {
+  id: pgInteger("id"),
+  description: pgText("description"),
+  location: pgCustomType({
+    dataType() {
+      return "point";
+    },
+  })("location"),
+});
+
+const mockItemsPaths = definePgTable("mock_items_paths", {
+  id: pgInteger("id"),
+  description: pgText("description"),
+  path: pgCustomType({
+    dataType() {
+      return "ltree";
+    },
+  })("path"),
+});
+
+async function verifyDocsIndexes() {
+  if (docsIndexes.length) {
+    const { generateDrizzleJson, generateMigration } =
+      await import("drizzle-kit/api-postgres");
+    const before = await generateDrizzleJson({});
+    const after = await generateDrizzleJson({ mockItems, arrayDemo });
+    const statements = await generateMigration(before, after);
+    const indexStatements = statements.filter((statement: string) =>
+      /^CREATE (UNIQUE )?INDEX/i.test(statement),
+    );
+    if (indexStatements.length !== docsIndexes.length) {
+      throw new Error(
+        `Expected ${docsIndexes.length} index statements, got ${indexStatements.length}`,
+      );
+    }
+    for (const statement of indexStatements) {
+      if (!statement.includes("USING paradedb"))
+        throw new Error(`Unexpected index DDL: ${statement}`);
+      await client.unsafe(statement);
+    }
+    for (const table of new Set(docsIndexes.map((index) => index.table))) {
+      const indexes =
+        await client`SELECT indexrelid FROM pg_index JOIN pg_class ON oid = indexrelid JOIN pg_am ON pg_am.oid = relam WHERE amname = 'paradedb' AND indrelid = ${table}::regclass AND indisvalid AND indisready`;
+      if (
+        indexes.length !==
+        docsIndexes.filter((index) => index.table === table).length
+      )
+        throw new Error(`Generated indexes on ${table} are missing or invalid`);
+    }
+  }
+}

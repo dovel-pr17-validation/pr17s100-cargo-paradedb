@@ -1,0 +1,20 @@
+CREATE INDEX search_idx ON mock_items
+USING paradedb (
+  id,
+  description,
+  category,
+  rating,
+  in_stock,
+  created_at,
+  metadata,
+  weight_range,
+  embedding vector_cosine_ops,
+  (description::pdb.simple('alias=description_simple')),
+  (lower(description)::pdb.literal('alias=literal_description'))
+)
+WITH (
+  json_fields = '{"metadata":{"fast":true}}'
+);
+
+CREATE INDEX orders_idx ON orders
+USING paradedb (order_id, product_id, order_quantity, order_total, customer_name);

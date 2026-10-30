@@ -1,0 +1,339 @@
+# workflows/benchmark-pg_search-queries.yml
+#
+# Benchmark pg_search (Queries)
+# Run the Stack Overflow queries benchmark suite against pg_search.
+
+name: Benchmark pg_search (Queries)
+
+# Stack Overflow runs on push to main, benchmarks/benchmark-stackoverflow labels, or manually.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/actions/benchmark-queries/**"
+      - ".github/actions/publish-benchmark-results/**"
+      - ".github/actions/benchmarks-from-main/**"
+      - ".github/actions/setup-benchmark-cluster/**"
+      - ".github/actions/setup-pg-search-build-environment/**"
+      - ".github/actions/setup-pg-search-toolchain/**"
+      - ".github/actions/setup-postgres/**"
+      - ".github/workflows/benchmark-pg_search-queries.yml"
+      - "benchmarks/**"
+      - "**/*.rs"
+      - "**/*.toml"
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "A specific commit hash or tag to benchmark. Uses `main` if not specified."
+        required: false
+        default: ""
+      fail_on_error:
+        description: "Whether to fail on query errors. Set to false for backfills against older versions."
+        required: false
+        type: boolean
+        default: true
+      use_benchmarks_from_ref:
+        description: "Whether to use benchmark code from the specified commit instead of main. Actions always come from this workflow."
+        required: false
+        type: boolean
+        default: false
+      publish_baseline:
+        description: "Whether to write the results to the gh-pages baseline that later runs are diffed against. Ignored unless this run is on main. Untick for an exploratory run you do not want recorded."
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  actions: write
+  contents: write
+  deployments: write
+  pull-requests: write
+
+# Benchmark jobs run in parallel. Publication jobs use the shared gh-pages queue.
+
+jobs:
+  benchmark-pg_search-queries:
+    name: Run Benchmark Jobs
+    timeout-minutes: 360
+    runs-on:
+      # To configure the runners: https://runs-on.com/configuration/job-labels/#how-it-works (runs in us-east-1)
+      - runs-on=${{ github.run_id }}
+      - retry=when-interrupted
+      - family=c8gd.metal-24xl # We use metal instances for benchmarks to keep variance low
+      - image=ubuntu26-full-arm64
+      - extras=s3-cache # See https://runs-on.com/caching/magic-cache/
+      # We deliberately do not enable EBS and instead rely on the on-machine NVMe drives to avoid the variance
+      # using EBS would cause
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'pull_request' &&
+        contains(fromJson('["benchmarks", "benchmark-stackoverflow"]'), github.event.label.name)
+      )
+    env:
+      pg_version: 18
+      BACKREST_STANZA: bench
+      BACKREST_REPO_BUCKET: paradedb-ci-benchmarks
+      BACKREST_REPO_PATH_PREFIX: /snapshots
+      BACKREST_REPO_REGION: us-east-1
+      BACKREST_REPO_ENDPOINT: s3.us-east-1.amazonaws.com
+      BACKREST_REPO_S3_KEY_TYPE: shared
+      # Only main writes the baseline. Every other run still fetches it and diffs against it,
+      # so a PR gets its comparison without being able to move the reference point.
+      PUBLISH_BASELINE: ${{ github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.publish_baseline) }}
+
+    steps:
+      # The job can be triggered manually by attaching the `benchmarks` label to a PR. This step
+      # removes the label once the job has started, so it can be applied again if needed.
+      - name: Maybe Remove Label
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(fromJson('["benchmarks", "benchmark-stackoverflow"]'), github.event.label.name)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr edit "${PR_NUMBER}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --remove-label benchmarks \
+            --remove-label benchmark-stackoverflow || true
+
+      - name: Determine Ref to Benchmark
+        id: determine-ref
+        env:
+          INPUTS_COMMIT: ${{ inputs.commit }}
+        run: |
+          # If a specific commit was provided via workflow_dispatch, use that.
+          # For pull_request events, benchmark the PR merge commit (github.sha),
+          # which exists in the base repo even for forks.
+          # Otherwise, default to main.
+          if [ -n "${INPUTS_COMMIT}" ]; then
+            echo "ref=${INPUTS_COMMIT}" >> "$GITHUB_OUTPUT"
+            echo "Determined ref from workflow_dispatch input: ${INPUTS_COMMIT}"
+          elif [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            echo "ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "Determined ref from pull_request event: ${GITHUB_SHA}"
+          else
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+            echo "Determined ref as default: main"
+          fi
+
+      # Keep workflow actions separate from the source commit being benchmarked
+      # so we can benchmark older commits with newer actions.
+      - name: Checkout Workflow Actions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Checkout Source to Benchmark
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.determine-ref.outputs.ref }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Resolve Benchmark Commit
+        id: commit_info
+        working-directory: source
+        run: echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # With extras=s3-cache, configure RunsOn before cache or artifact operations.
+      - name: Configure RunsOn Caching
+        uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_CI_SUBACCOUNT_GITHUB_ACTIONS_USER_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_CI_SUBACCOUNT_GITHUB_ACTIONS_USER_AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Fetch Latest Benchmark Code, Suites
+        if: >-
+          !inputs.use_benchmarks_from_ref && !contains(fromJson('["benchmarks", "benchmark-stackoverflow"]'), github.event.label.name)
+        uses: ./.github/actions/benchmarks-from-main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          source_directory: source
+
+      - name: Resolve Git Ref to PR
+        id: pr_label
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          # ← Set this to whatever ref you’re resolving:
+          # • a SHA:            ${{ github.sha }}
+          # • a branch name:    ${{ github.ref_name }}
+          # • a tag:            ${{ github.ref_name }}
+          # • a PR number:      e.g. “123”
+          TARGET_REF: ${{ steps.commit_info.outputs.commit_sha }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          result-encoding: string
+          script: |
+            const { owner, repo } = context.repo;
+            const ref = process.env.TARGET_REF;
+
+            let pr = null;
+
+            // If the ref is purely numeric, treat it as a PR number
+            if (/^\d+$/.test(ref)) {
+              try {
+                const { data } = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: parseInt(ref, 10)
+                });
+                pr = data;
+              } catch (e) {
+                // not a valid PR number → fall through
+              }
+            }
+
+            // Otherwise, try to find any PR associated with this commit SHA
+            if (!pr) {
+              const res = await github.request(
+                'GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls',
+                {
+                  owner,
+                  repo,
+                  commit_sha: ref,
+                  headers: {
+                    accept: 'application/vnd.github.groot-preview+json'
+                  }
+                }
+              );
+              if (res.data.length) {
+                pr = res.data[0];
+              }
+            }
+
+            // Return “PR #123: Title” or the raw ref
+            return pr
+              ? `PR #${pr.number}: ${pr.title}`
+              : ref;
+
+      - name: Running for ${{ steps.pr_label.outputs.result }}
+        env:
+          STEP_PR_LABEL_RESULT: ${{ steps.pr_label.outputs.result }}
+        run: echo "${STEP_PR_LABEL_RESULT}"
+
+      - name: Set Up Benchmark Cluster
+        uses: ./.github/actions/setup-benchmark-cluster
+        with:
+          source_directory: source
+          pg_version: ${{ env.pg_version }}
+
+      # Benchmark "stackoverflow" dataset at multiple scales (100K, 1M, 20M). Each size restores its
+      # heap snapshot from S3 (replacing the whole cluster), then the benchmark builds the index and
+      # runs queries against it.
+      - name: Restore "stackoverflow" Heap Snapshot (100K)
+        run: |
+          set -euo pipefail
+          (cd source/pg_search && cargo pgrx stop pg${{ env.pg_version }})
+          (cd source/benchmarks && cargo run --release -- restore-heap \
+            --dataset stackoverflow \
+            --size 100k \
+            --pgdata "/home/runner/.pgrx/data-${{ env.pg_version }}" \
+            --stanza "${BACKREST_STANZA}" \
+            --repo-bucket "${BACKREST_REPO_BUCKET}" \
+            --repo-path-prefix "${BACKREST_REPO_PATH_PREFIX}" \
+            --repo-region "${BACKREST_REPO_REGION}" \
+            --repo-endpoint "${BACKREST_REPO_ENDPOINT}" \
+            --repo-s3-key-type "${BACKREST_REPO_S3_KEY_TYPE}")
+          (cd source/pg_search && cargo pgrx start pg${{ env.pg_version }})
+
+      - name: Benchmark "stackoverflow" Dataset (100K)
+        uses: ./.github/actions/benchmark-queries
+        with:
+          source_directory: source
+          dataset: stackoverflow
+          index: bm25
+          size: 100k
+          ref: ${{ steps.commit_info.outputs.commit_sha }}
+          fail_on_error: ${{ github.event_name != 'workflow_dispatch' || inputs.fail_on_error }}
+          publish_baseline: ${{ env.PUBLISH_BASELINE }}
+
+      - name: Restore "stackoverflow" Heap Snapshot (1M)
+        run: |
+          set -euo pipefail
+          (cd source/pg_search && cargo pgrx stop pg${{ env.pg_version }})
+          (cd source/benchmarks && cargo run --release -- restore-heap \
+            --dataset stackoverflow \
+            --size 1m \
+            --pgdata "/home/runner/.pgrx/data-${{ env.pg_version }}" \
+            --stanza "${BACKREST_STANZA}" \
+            --repo-bucket "${BACKREST_REPO_BUCKET}" \
+            --repo-path-prefix "${BACKREST_REPO_PATH_PREFIX}" \
+            --repo-region "${BACKREST_REPO_REGION}" \
+            --repo-endpoint "${BACKREST_REPO_ENDPOINT}" \
+            --repo-s3-key-type "${BACKREST_REPO_S3_KEY_TYPE}")
+          (cd source/pg_search && cargo pgrx start pg${{ env.pg_version }})
+
+      - name: Benchmark "stackoverflow" Dataset (1M)
+        uses: ./.github/actions/benchmark-queries
+        with:
+          source_directory: source
+          dataset: stackoverflow
+          index: bm25
+          size: 1m
+          ref: ${{ steps.commit_info.outputs.commit_sha }}
+          fail_on_error: ${{ github.event_name != 'workflow_dispatch' || inputs.fail_on_error }}
+          publish_baseline: ${{ env.PUBLISH_BASELINE }}
+
+      - name: Restore "stackoverflow" Heap Snapshot (20M)
+        run: |
+          set -euo pipefail
+          (cd source/pg_search && cargo pgrx stop pg${{ env.pg_version }})
+          (cd source/benchmarks && cargo run --release -- restore-heap \
+            --dataset stackoverflow \
+            --size 20m \
+            --pgdata "/home/runner/.pgrx/data-${{ env.pg_version }}" \
+            --stanza "${BACKREST_STANZA}" \
+            --repo-bucket "${BACKREST_REPO_BUCKET}" \
+            --repo-path-prefix "${BACKREST_REPO_PATH_PREFIX}" \
+            --repo-region "${BACKREST_REPO_REGION}" \
+            --repo-endpoint "${BACKREST_REPO_ENDPOINT}" \
+            --repo-s3-key-type "${BACKREST_REPO_S3_KEY_TYPE}")
+          (cd source/pg_search && cargo pgrx start pg${{ env.pg_version }})
+
+      - name: Benchmark "stackoverflow" Dataset (20M)
+        uses: ./.github/actions/benchmark-queries
+        with:
+          source_directory: source
+          dataset: stackoverflow
+          index: bm25
+          size: 20m
+          ref: ${{ steps.commit_info.outputs.commit_sha }}
+          fail_on_error: ${{ github.event_name != 'workflow_dispatch' || inputs.fail_on_error }}
+          publish_baseline: ${{ env.PUBLISH_BASELINE }}
+
+  publish-results:
+    name: Publish Benchmark Results
+    needs: [benchmark-pg_search-queries]
+    if: always() && !cancelled() && (contains(needs.*.result, 'success') || contains(needs.*.result, 'failure'))
+    uses: ./.github/workflows/publish-benchmark-results.yml
+    secrets: inherit
+
+  notify-slack-on-failure:
+    name: Notify Slack on Failure
+    needs: [benchmark-pg_search-queries, publish-results]
+    if: always() && (needs.benchmark-pg_search-queries.result == 'failure' || needs.publish-results.result == 'failure') && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      checks: read
+    steps:
+      - name: Notify Slack on Failure (Push only)
+        uses: paradedb/actions/slack-alert@8f17ece584400f0113ff8ddb1b14f28b6fd10050 # v14
+        with:
+          suppress_spot_retries: "true" # Defer Slack alerts while RunsOn retries Spot interruptions
+          job_results: ${{ toJSON(needs) }}
+          webhook_url: ${{ secrets.SLACK_GITHUB_CHANNEL_WEBHOOK_URL }}
+          mention: "<!subteam^S0BLE20RYPM|@pg_search-maintainers>"
+          title: "${{ github.workflow }} Failed"

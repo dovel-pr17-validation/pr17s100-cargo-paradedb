@@ -1,0 +1,102 @@
+# workflows/lint-rust.yml
+#
+# Lint Rust
+# Lint Rust files using Clippy and Rustfmt.
+
+name: Lint Rust
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - ".github/actions/setup-pg-search-toolchain/**"
+      - ".github/scripts/check_impl_drop.py"
+      - ".github/workflows/lint-rust.yml"
+      - "Cargo.lock"
+      - "**/*.rs"
+      - "**/*.toml"
+  workflow_dispatch:
+
+concurrency:
+  group: lint-rust-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-rust:
+    name: Lint Rust Files
+    runs-on:
+      # Compute-optimized c-family — Rust clippy/fmt is CPU-bound.
+      # See https://runs-on.com/configuration/job-labels/ — runs in us-east-1.
+      - runs-on=${{ github.run_id }}
+      - retry=when-interrupted
+      - family=c7g+c8g
+      - cpu=4
+      - ram=8
+      - image=ubuntu26-full-arm64
+      - volume=80gb # default runner ships with 30GB — see https://runs-on.com/runners/linux/
+      - extras=s3-cache
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [18]
+
+    steps:
+      - name: Checkout Git Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # With extras=s3-cache, configure RunsOn before cache or artifact operations.
+      - name: Configure RunsOn Caching
+        uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2
+
+      # A bare `impl Drop` can abort the backend during an ERROR or at exit (#6479, #6530).
+      - name: Check impl Drop
+        run: python3 .github/scripts/check_impl_drop.py
+
+      - name: Set Up pg_search Toolchain
+        uses: ./.github/actions/setup-pg-search-toolchain
+        with:
+          pg_version: ${{ matrix.pg_version }}
+          rust_components: rustfmt, clippy
+
+      - name: Check Cargo.lock
+        run: cargo metadata --format-version 1 --locked > /dev/null
+
+      - name: Install & Configure Supported PostgreSQL Version
+        uses: ./.github/actions/setup-postgres
+        with:
+          pg_version: ${{ matrix.pg_version }}
+          extra_packages: clang libclang-dev lld libfontconfig1-dev libopenblas-dev
+
+      - name: Run Rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Run Rustdoc
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --document-private-items
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings --no-deps
+
+      - name: Install cargo-machete
+        run: cargo install -j $(nproc) cargo-machete --locked --debug
+
+      - name: Install cargo-audit
+        run: cargo install -j $(nproc) cargo-audit --locked --debug
+
+      - name: Install taplo
+        run: cargo install -j $(nproc) taplo-cli --version ^0.9 --locked --debug
+
+      - name: Run cargo-machete
+        run: cargo machete
+
+      # Ignores are documented in .cargo/audit.toml.
+      - name: Run cargo-audit
+        run: cargo audit
+
+      # If you encounter an error, try running 'taplo format' to fix the formatting automatically.
+      - name: Check Cargo.toml Formatting
+        run: taplo format --check

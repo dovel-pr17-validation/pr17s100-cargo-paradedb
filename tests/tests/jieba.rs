@@ -1,0 +1,132 @@
+// Copyright (c) 2023-2026 ParadeDB, Inc.
+//
+// This file is part of ParadeDB - Postgres for Search and Analytics
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+use pretty_assertions::assert_eq;
+use rstest::*;
+use sqlx::PgConnection;
+use tests::fixtures::*;
+
+// Helper function to run tokenize and collect results
+fn get_tokens(conn: &mut PgConnection, tokenizer_type: &str, text: &str) -> Vec<(String, i32)> {
+    let query_str = format!(
+        "SELECT token, position FROM paradedb.tokenize(paradedb.tokenizer('{tokenizer_type}'), '{text}') ORDER BY position;"
+    );
+    query_str.fetch(conn)
+}
+
+#[rstest]
+fn test_jieba_tokenizer_basic(mut conn: PgConnection) {
+    // Test the paradedb.tokenize function directly
+    // Positions should be sequential token ordinals (0, 1, 2, ...), not character offsets
+    let tokens = get_tokens(&mut conn, "jieba", "我们都有光明的前途");
+    assert_eq!(
+        tokens,
+        vec![
+            ("我们".to_string(), 0),
+            ("都".to_string(), 1),
+            ("有".to_string(), 2),
+            ("光明".to_string(), 3),
+            ("的".to_string(), 4),
+            ("前途".to_string(), 5),
+        ],
+        "Failed on '我们都有光明的前途'"
+    );
+
+    let tokens = get_tokens(&mut conn, "jieba", "李宇");
+    assert_eq!(tokens, vec![("李宇".to_string(), 0),], "Failed on '李宇'");
+
+    let tokens = get_tokens(&mut conn, "jieba", "公安");
+    assert_eq!(tokens, vec![("公安".to_string(), 0),], "Failed on '公安'");
+
+    let tokens = get_tokens(&mut conn, "jieba", "转移就业");
+    assert_eq!(
+        tokens,
+        vec![("转移".to_string(), 0), ("就业".to_string(), 1),],
+        "Failed on '转移就业'"
+    );
+}
+
+#[rstest]
+fn test_jieba_tokenizer_indexing(mut conn: PgConnection) {
+    // Create a table and index using the jieba tokenizer
+    r#"CREATE TABLE chinese_texts (
+            id SERIAL PRIMARY KEY,
+            content TEXT
+        );"#
+    .execute(&mut conn);
+
+    r#"INSERT INTO chinese_texts (content) VALUES
+            ('我们都有光明的前途'),
+            ('李宇给公安局打了电话'),
+            ('这项政策旨在促进劳动力转移就业');"#
+        .execute(&mut conn);
+
+    r#"CREATE INDEX chinese_texts_idx ON chinese_texts
+        USING paradedb (id, (content::pdb.jieba));"#
+        .execute(&mut conn);
+
+    // Test searching using fetch/fetch_one extension methods
+    let rows: Vec<(i32,)> =
+        r#"SELECT id FROM chinese_texts WHERE content ||| '光明' ORDER BY id"#.fetch(&mut conn);
+    assert_eq!(rows, vec![(1,)], "Failed on 'content:光明'");
+
+    let row: (i32,) = r#"SELECT id FROM chinese_texts WHERE content ||| '公安局' ORDER BY id"#
+        .fetch_one(&mut conn);
+    assert_eq!(row, (2,), "Failed on 'content:公安局'");
+
+    let row: (i32,) =
+        r#"SELECT id FROM chinese_texts WHERE content ||| '就业' ORDER BY id"#.fetch_one(&mut conn);
+    assert_eq!(row, (3,), "Failed on 'content:就业'");
+}
+
+#[rstest]
+fn test_jieba_query_search_mode(mut conn: PgConnection) {
+    r#"
+    CREATE TABLE jieba_search_mode (id INT PRIMARY KEY, content TEXT);
+    INSERT INTO jieba_search_mode VALUES
+        (1, '南京市长江大桥'),
+        (2, '南京'),
+        (3, '你好');
+    CREATE INDEX jieba_search_mode_idx ON jieba_search_mode
+        USING paradedb (id, (content::pdb.jieba));
+    "#
+    .execute(&mut conn);
+
+    // The default query tokenizer matches both the compound and its parts.
+    let rows: Vec<(i32,)> = r#"
+        SELECT id FROM jieba_search_mode
+        WHERE content ||| '南京市长江大桥' ORDER BY id
+    "#
+    .fetch(&mut conn);
+    assert_eq!(rows, vec![(1,), (2,)]);
+
+    for (tokenizer, expected) in [
+        (r#"{"type":"jieba"}"#, vec![(1,), (2,)]),
+        (r#"{"type":"jieba","search_mode":true}"#, vec![(1,), (2,)]),
+        (r#"{"type":"jieba","search_mode":false}"#, vec![(1,)]),
+    ] {
+        // Disabling query decomposition excludes the document containing only 南京.
+        let rows: Vec<(i32,)> = format!(
+            r#"SELECT id FROM jieba_search_mode
+               WHERE id @@@ paradedb.match(
+                   'content', '南京市长江大桥', tokenizer => '{tokenizer}'::jsonb
+               ) ORDER BY id"#
+        )
+        .fetch(&mut conn);
+        assert_eq!(rows, expected, "query tokenizer: {tokenizer}");
+    }
+}
